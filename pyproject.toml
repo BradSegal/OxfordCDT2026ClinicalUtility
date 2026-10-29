@@ -7,7 +7,15 @@ name = "cdt-clinical-utility"
 version = "0.1.0"
 description = "Clinical decisions from simulated ECG model scores: a Colab teaching practical"
 requires-python = ">=3.10"
-dependencies = ["numpy>=1.24", "plotly>=5.18", "ipywidgets>=8"]
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "scikit-learn>=1.6",
+    "scipy>=1.15",
+    "statsmodels>=0.15",
+    "plotly>=5.18",
+    "ipywidgets>=7.7",
+]
 authors = [{name = "Bradley Segal"}]
 license = "MIT"
 

@@ -1,197 +1,150 @@
-"""Comparing two models on the same recordings: ranking, reclassification and net benefit.
+"""Comparing two models on the same recordings: reclassification and net-benefit differences.
 
-Conventions: ``y`` is 1 for reference AF and 0 otherwise. A recording is
-reviewed when its probability is >= the threshold, matching
-``reference.should_review``. "Up" means the new model places a recording in a
-higher-risk category than the old model. Undefined quantities (no AF or no
-non-AF recordings) are NaN, never 0. Non-finite scores are refused, as in
-``reference``.
+Conventions: ``y`` is True for reference AF. A recording is reviewed when its
+score is at or above the cut. "Up" means the new model reviews a recording
+that the old one did not. Net reclassification improvement (NRI) and the
+integrated discrimination improvement (IDI) have no standard Python
+implementation, so they are written out here; the bootstrap comes from
+``scipy.stats.bootstrap``.
 """
 
 import numpy as np
+import pandas as pd
+from scipy import stats
 
-from .reference import net_benefit
+from .reference import OUTCOMES, RESAMPLES, SEED, operating_points, paired_bootstrap
 
 
-def _arrays(*probabilities, y):
-    y = np.asarray(y, dtype=float)
-    if not np.isin(y, (0, 1)).all():
-        raise ValueError("Reference labels must be 0 or 1.")
-    arrays = [np.asarray(p, dtype=float) for p in probabilities]
-    if any(len(a) != len(y) for a in arrays):
+def _arrays(old, new, y):
+    old, new = np.asarray(old, dtype=float), np.asarray(new, dtype=float)
+    y = np.asarray(y, dtype=bool)
+    if not (len(old) == len(new) == len(y)):
         raise ValueError("Every input needs one value per recording.")
-    if not all(np.isfinite(a).all() for a in arrays):
-        raise ValueError("Scores must be finite; NaN or infinite scores have no place in a ranking.")
-    return (*arrays, y.astype(bool))
-
-
-def _mean(values):
-    return float(np.mean(values)) if len(values) else float("nan")
-
-
-def auc(scores, y):
-    """Area under the ROC curve = P(score of an AF recording > score of a non-AF one).
-
-    Ties count one half (the Mann-Whitney statistic). NaN without both classes.
-    """
-    scores, y = _arrays(scores, y=y)
-    positives, negatives = scores[y], scores[~y]
-    if not len(positives) or not len(negatives):
-        return float("nan")
-    order = np.sort(negatives)
-    below = np.searchsorted(order, positives, side="left")
-    ties = np.searchsorted(order, positives, side="right") - below
-    return float((below + .5 * ties).sum() / (len(positives) * len(negatives)))
-
-
-def risk_category(probabilities, cuts):
-    """Category index: 0 below cuts[0], i below cuts[i] and >= cuts[i-1], len(cuts) above."""
-    return np.searchsorted(np.asarray(cuts, dtype=float), np.asarray(probabilities, dtype=float),
-                           side="right")
-
-
-def reclassification_table(old_probs, new_probs, y, cuts):
-    """Cross-tabulate old (rows) against new (columns) risk categories, separately by outcome.
-
-    Returns {"labels", "events", "non_events"}; each table is a list of rows of counts.
-    """
-    old, new, y = _arrays(old_probs, new_probs, y=y)
-    cuts = [float(c) for c in cuts]
-    edges = [0.0, *cuts, 1.0]
-    labels = [f"[{lo:g}, {hi:g})" for lo, hi in zip(edges[:-1], edges[1:])]
-    labels[-1] = labels[-1][:-1] + "]"
-    old_cat, new_cat = risk_category(old, cuts), risk_category(new, cuts)
-    k = len(cuts) + 1
-
-    def table(mask):
-        counts = np.zeros((k, k), dtype=int)
-        np.add.at(counts, (old_cat[mask], new_cat[mask]), 1)
-        return counts.tolist()
-
-    return {"labels": labels, "events": table(y), "non_events": table(~y)}
+    if not (np.isfinite(old).all() and np.isfinite(new).all()):
+        raise ValueError("Scores must be finite.")
+    return old, new, y
 
 
 def _nri(up, down, y):
-    event = _mean(up[y]) - _mean(down[y])
-    non_event = _mean(down[~y]) - _mean(up[~y])
-    return {"event": event, "non_event": non_event, "total": event + non_event}
+    event = up[y].mean() - down[y].mean()
+    non_event = down[~y].mean() - up[~y].mean()
+    return {"event": float(event), "non_event": float(non_event), "total": float(event + non_event)}
 
 
-def categorical_nri(old_probs, new_probs, y, cuts):
-    """Net reclassification improvement across risk categories.
-
-    event NRI     = P(up | AF) - P(down | AF)
-    non-event NRI = P(down | no AF) - P(up | no AF)
-    total         = event + non-event.
-    The total adds two proportions with equal weight, whatever the prevalence
-    or the relative cost of the errors; it is not a measure of net benefit.
-    """
-    old, new, y = _arrays(old_probs, new_probs, y=y)
-    old_cat, new_cat = risk_category(old, cuts), risk_category(new, cuts)
-    return _nri(new_cat > old_cat, new_cat < old_cat, y)
+def categorical_nri(old, new, y, cut):
+    """NRI at one cut: event = P(up | AF) - P(down | AF); non-event = P(down | no AF) - P(up | no AF)."""
+    old, new, y = _arrays(old, new, y)
+    before, after = old >= cut, new >= cut
+    return _nri(after & ~before, before & ~after, y)
 
 
-def continuous_nri(old_probs, new_probs, y):
-    """Category-free NRI: any increase counts as up and any decrease as down; ties are neither."""
-    old, new, y = _arrays(old_probs, new_probs, y=y)
+def continuous_nri(old, new, y):
+    """Category-free NRI: any rise in score counts as up and any fall as down; ties count neither."""
+    old, new, y = _arrays(old, new, y)
     return _nri(new > old, new < old, y)
 
 
-def idi(old_probs, new_probs, y):
-    """Integrated discrimination improvement.
+def idi(old, new, y):
+    """IDI: mean rise in score among AF recordings plus mean fall among the rest."""
+    old, new, y = _arrays(old, new, y)
+    event, non_event = (new[y] - old[y]).mean(), (old[~y] - new[~y]).mean()
+    return {"event": float(event), "non_event": float(non_event), "total": float(event + non_event)}
 
-    event     = mean(new - old) among AF recordings
-    non_event = mean(old - new) among non-AF recordings
-    total     = event + non_event (the change in discrimination slope).
+
+def reclassification(frame, old, new, cut):
+    """Counts of old action (rows) against new action (columns), separately by reference AF."""
+    return pd.crosstab([frame["af"].rename("AF"), (frame[old] >= cut).rename(f"{old} review")],
+                       (frame[new] >= cut).rename(f"{new} review"))
+
+
+def _delta_statistic(p_t):
+    weight = p_t / (1 - p_t)
+
+    def statistic(y, old_review, new_review, axis=-1):
+        value = np.where(y, 1.0, -weight)
+        return np.mean((new_review.astype(float) - old_review) * value, axis=axis)
+    return statistic
+
+
+def delta_net_benefit(y, old_review, new_review, p_t, resamples=RESAMPLES, seed=SEED):
+    """NB(new) - NB(old) with a 95% paired percentile bootstrap interval.
+
+    Each recording contributes +1 if it is AF and moves into review, -1 if it
+    is AF and moves out, -p_t/(1-p_t) if it is not AF and moves in, and the
+    opposite if it moves out; the mean of these contributions is the difference.
     """
-    old, new, y = _arrays(old_probs, new_probs, y=y)
-    event = _mean(new[y] - old[y])
-    non_event = _mean(old[~y] - new[~y])
-    return {"event": event, "non_event": non_event, "total": event + non_event}
+    y = np.asarray(y, dtype=bool)
+    old_review, new_review = np.asarray(old_review, dtype=bool), np.asarray(new_review, dtype=bool)
+    statistic = _delta_statistic(p_t)
+    result = paired_bootstrap((y, old_review, new_review), statistic, resamples, seed)
+    return {"estimate": float(statistic(y, old_review, new_review)),
+            "low": float(result.confidence_interval.low),
+            "high": float(result.confidence_interval.high)}
 
 
-def counts_at_threshold(probabilities, y, threshold):
-    """TP, FP, FN and TN when recordings with probability >= threshold are reviewed."""
-    p, y = _arrays(probabilities, y=y)
-    review = p >= threshold
-    return {"TP": int(np.sum(review & y)), "FP": int(np.sum(review & ~y)),
-            "FN": int(np.sum(~review & y)), "TN": int(np.sum(~review & ~y))}
+def changed_decisions(frame, old, new, cut, p_t):
+    """The recordings whose review decision changes between the two models, in input order.
 
-
-def policy_net_benefit(probabilities, y, threshold_probability):
-    """NB = TP/n - FP/n * p_t / (1 - p_t), reviewing when probability >= p_t."""
-    return net_benefit(counts_at_threshold(probabilities, y, threshold_probability),
-                       threshold_probability)
-
-
-def delta_net_benefit_bootstrap(old_probs, new_probs, y, threshold_probability,
-                                resamples=1000, seed=20261106, level=.95):
-    """NB(new) - NB(old) at one threshold, with a recording-level percentile bootstrap CI.
-
-    Each resample draws n recordings with replacement and recomputes both net
-    benefits on the same draw, so the interval reflects the paired comparison.
-    Returns {"estimate", "low", "high", "resamples", "seed", "level"}.
+    Columns: recording, reference_label, both scores, direction ("up" or "down")
+    and contribution, the change in that recording's net-benefit value.
     """
-    old, new, y = _arrays(old_probs, new_probs, y=y)
-    p = threshold_probability
-    if not 0 < p < 1:
-        raise ValueError("Threshold probability must be strictly between 0 and 1.")
-    weight = p / (1 - p)
-    # Per-recording contribution to NB: +1 for a true positive, -weight for a false positive.
-    contribution = ((new >= p).astype(float) - (old >= p)) * np.where(y, 1.0, -weight)
-    rng = np.random.default_rng(seed)
-    draws = rng.integers(0, len(y), size=(resamples, len(y)))
-    boot = contribution[draws].mean(axis=1)
-    tail = (1 - level) / 2
-    return {"estimate": float(contribution.mean()),
-            "low": float(np.quantile(boot, tail)), "high": float(np.quantile(boot, 1 - tail)),
-            "resamples": resamples, "seed": seed, "level": level}
+    before, after = frame[old] >= cut, frame[new] >= cut
+    changed = frame[before != after]
+    value = np.where(changed["af"], 1.0, -p_t / (1 - p_t))
+    moved_up = after[before != after]
+    return pd.DataFrame({"recording": changed["recording"],
+                         "reference_label": changed["reference_label"],
+                         old: changed[old], new: changed[new],
+                         "direction": np.where(moved_up, "up", "down"),
+                         "contribution": np.where(moved_up, value, -value)}).reset_index(drop=True)
 
 
-def minimum_losses(scores, y, costs, miss_prices):
-    """Each miss price's minimum total loss over every cutoff, other prices fixed.
+def compare_net_benefit(frame, cutoffs, p_t):
+    """Net benefit of each model's decisions at its own cutoff, all valued at the same p_t."""
+    from .reference import net_benefit
+    y = frame["af"].to_numpy()
+    return {model: net_benefit(y, frame[model].to_numpy() >= cut, p_t)
+            for model, cut in cutoffs.items()}
 
-    Cutoffs are every distinct score plus review-all and review-none, as in
-    ``reference.sweep_thresholds``. ``costs`` supplies C_TP, C_FP and C_TN;
-    C_FN takes each value in ``miss_prices`` in turn.
+
+NO_FLIP = np.inf
+
+
+def _flip(y, old_scores, new_scores, base_costs, prices):
+    minima = []
+    for scores in (old_scores, new_scores):
+        points = operating_points(y, scores, base_costs)
+        fixed = sum(points[k].to_numpy() * base_costs[k] for k in OUTCOMES if k != "FN")
+        minima.append((fixed[None, :] + prices[:, None] * points["FN"].to_numpy()).min(axis=1))
+    caught = np.flatnonzero(minima[1] <= minima[0])
+    return float(prices[caught[0]]) if len(caught) else NO_FLIP
+
+
+def bootstrap_flip_prices(frame, old, new, base_costs, miss_prices, resamples=200, seed=SEED):
+    """The flip price on paired bootstrap resamples of the recordings.
+
+    ``scipy.stats.bootstrap`` resamples the recordings with both models'
+    scores and the label kept together; in each resample the statistic is the
+    first miss price at which the new model's minimum loss is no greater than
+    the old model's, or ``NO_FLIP`` (infinity) when there is none in
+    ``miss_prices``. Returns ``{"flips", "no_flip"}``: the flip prices found
+    and the number of resamples without one.
     """
-    scores, y = _arrays(scores, y=y)
-    order = np.argsort(scores, kind="stable")
-    ordered, truth = scores[order], y[order]
-    below = np.r_[0, np.searchsorted(ordered, np.unique(ordered), side="left"), len(ordered)]
-    fn = np.r_[0, np.cumsum(truth)][below]
-    tn = below - fn
-    tp, fp = int(truth.sum()) - fn, len(truth) - int(truth.sum()) - tn
-    fixed = tp * costs["TP"] + fp * costs["FP"] + tn * costs["TN"]
-    return np.array([np.min(fixed + miss * fn) for miss in miss_prices])
+    prices = np.asarray(list(miss_prices), dtype=float)
+    data_ = (frame["af"].to_numpy(dtype=bool), frame[old].to_numpy(dtype=float),
+             frame[new].to_numpy(dtype=float))
+
+    def statistic(y, old_scores, new_scores):
+        return _flip(y, old_scores, new_scores, base_costs, prices)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the percentile interval of a draw with NO_FLIP is unused
+        result = stats.bootstrap(data_, statistic, paired=True, vectorized=False,
+                                 n_resamples=resamples, method="percentile",
+                                 rng=np.random.default_rng(seed))
+    draws = result.bootstrap_distribution
+    return {"flips": draws[np.isfinite(draws)].astype(int), "no_flip": int(np.sum(~np.isfinite(draws)))}
 
 
-def flip_price(old_scores, new_scores, y, costs, miss_prices):
-    """First miss price at which the new model's minimum loss is no greater than the old's.
-
-    Returns None when the new model never catches up within ``miss_prices``.
-    """
-    old = minimum_losses(old_scores, y, costs, miss_prices)
-    new = minimum_losses(new_scores, y, costs, miss_prices)
-    for miss, a, b in zip(miss_prices, old, new):
-        if b <= a:
-            return miss
-    return None
-
-
-def bootstrap_flip_prices(old_scores, new_scores, y, costs, miss_prices, resamples=200,
-                          seed=20261106):
-    """``flip_price`` on paired recording-level bootstrap resamples of one cohort.
-
-    Each resample draws n recordings with replacement and keeps both models'
-    scores and the label together. The spread shows how far the flip price
-    could move on another sample of the same size; it says nothing about a
-    different population.
-    """
-    old, new, y = _arrays(old_scores, new_scores, y=y)
-    rng = np.random.default_rng(seed)
-    flips = []
-    for _ in range(resamples):
-        rows = rng.integers(0, len(y), len(y))
-        flips.append(flip_price(old[rows], new[rows], y[rows], costs, miss_prices))
-    return flips
+__all__ = ["categorical_nri", "continuous_nri", "idi", "reclassification", "delta_net_benefit",
+           "changed_decisions", "compare_net_benefit", "bootstrap_flip_prices", "NO_FLIP"]

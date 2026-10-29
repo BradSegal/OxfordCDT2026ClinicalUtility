@@ -1,75 +1,58 @@
-"""Load small vendored labels and simulated scores without network access."""
+"""Load the vendored CinC 2017 labels and the course scores as pandas DataFrames."""
 
-import csv
+import io
 import json
+from functools import lru_cache
 from importlib.resources import files
 
-import numpy as np
+import pandas as pd
 
 MODEL_NAMES = {
     "random_forest": "Random forest · ECG features",
     "resnet": "1D ResNet · waveform",
     "resnet_calibrated": "1D ResNet · recalibrated",
 }
-
-
-def teaching_cases():
-    return json.loads(files("clinical_utility").joinpath("assets/teaching_cases.json").read_text())
-
-
-def provenance():
-    return json.loads(files("clinical_utility").joinpath("assets/provenance.json").read_text())
-
-
 SPLITS = ("development", "calibration", "evaluation")
 
 
-def _rows():
-    text = files("clinical_utility").joinpath("assets/predictions.csv").read_text()
-    return list(csv.DictReader(text.splitlines()))
+def _asset(name):
+    return files("clinical_utility").joinpath(f"assets/{name}").read_text()
 
 
-def load_records(model="random_forest", split="development"):
-    """Assessable A/N/O records only; original reference labels remain visible.
-
-    Noise records are retained in REFERENCE-v3.csv and counted in provenance.
-    They are not assigned fabricated binary AF truth.
-    """
-    if model not in MODEL_NAMES:
-        raise ValueError(f"Choose a model from {list(MODEL_NAMES)}.")
-    if split not in SPLITS:
-        raise ValueError("Choose development, calibration or evaluation.")
-    rows = []
-    for row in _rows():
-        if row["split"] == split:
-            rows.append({"recording": row["recording"], "reference_label": row["reference_label"],
-                         "af_present": row["reference_label"] == "A", "score": float(row[model]),
-                         "model": model, "split": split})
-    return rows
+@lru_cache(maxsize=1)
+def provenance():
+    return json.loads(_asset("provenance.json"))
 
 
-def load_arrays(split="development"):
-    """One split as numpy arrays: recording, reference_label, af_present and every model column.
-
-    Rows are in the same order as ``load_records`` for that split.
-    """
-    if split not in SPLITS:
-        raise ValueError("Choose development, calibration or evaluation.")
-    rows = [row for row in _rows() if row["split"] == split]
-    table = {"recording": np.array([r["recording"] for r in rows]),
-             "reference_label": np.array([r["reference_label"] for r in rows])}
-    table["af_present"] = table["reference_label"] == "A"
+@lru_cache(maxsize=1)
+def _scores():
+    # Read as text, then convert: every float was written with repr, and this keeps it exact.
+    frame = pd.read_csv(io.StringIO(_asset("predictions.csv")), dtype=str)
     for model in MODEL_NAMES:
-        table[model] = np.array([float(r[model]) for r in rows])
-    return table
+        frame[model] = frame[model].astype(float)
+    frame.insert(2, "af", frame["reference_label"] == "A")
+    return frame
+
+
+def load_scores():
+    """Every assessable (A, N or O) recording, one row each.
+
+    Columns: ``recording``, ``reference_label`` (A, N or O), ``af`` (True for A),
+    ``split`` (development, calibration or evaluation) and one score column per
+    model. Noise recordings (``~``) are not here: they have no binary AF
+    reference. Each call returns a fresh copy, so a learner can add columns.
+    """
+    return _scores().copy()
+
+
+def six_recordings():
+    """The six hand-checkable development recordings, in the order of ``provenance()``."""
+    frame = load_scores()
+    six = provenance()["six_recordings"]
+    return frame.set_index("recording").loc[six].reset_index()
 
 
 def reference_labels():
-    """Every CinC 2017 recording's reference label, A, N, O or ~ (noise), by recording ID."""
-    text = files("clinical_utility").joinpath("assets/REFERENCE-v3.csv").read_text()
-    return {row[0]: row[1] for row in csv.reader(text.splitlines()) if row}
-
-
-def split_of():
-    """The teaching split of every assessable (A, N or O) recording, by recording ID."""
-    return {row["recording"]: row["split"] for row in _rows()}
+    """Every CinC 2017 recording's reference label (A, N, O or ~) as a DataFrame."""
+    return pd.read_csv(io.StringIO(_asset("REFERENCE-v3.csv")), header=None,
+                       names=["recording", "reference_label"], dtype=str)

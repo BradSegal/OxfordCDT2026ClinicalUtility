@@ -1,19 +1,19 @@
-"""Feedback for extension exercises, including small counterexamples to common errors.
+"""Feedback for the extension exercises, with counterexamples to common errors.
 
 Each case gives the arguments, the expected answer and a default hint. A case
 may also list other valid answers (``accept``) and plausible wrong answers with
 their own hints (``diagnose``), so a learner hears which misconception they hit.
-A returned value of the wrong kind, or a dictionary without the expected keys,
-is reported before any calculation is compared. Learner functions are called
-only inside the feedback boundary. Normal notebook use never raises;
-UTILITY_STRICT=1 makes worked-copy verification fail visibly. Reference
-calculations live in the existing semantic modules.
+A returned value of the wrong kind, or a dictionary or table without the
+expected keys or columns, is reported before any calculation is compared.
+Answers that are fitted scikit-learn models or tables get their own checks.
+Learner code is called only inside the feedback boundary. Normal notebook use
+never raises; UTILITY_STRICT=1 makes worked-copy verification fail visibly.
 
-``ready`` lets a later cell wait for a learner function, naming the problem,
-how to unblock it and how to recover (the core's ``RECOVERY``: Runtime > Run
+``ready`` lets a later cell wait for a learner answer, naming the problem, how
+to unblock it and how to recover (the core's ``RECOVERY``: Runtime > Run
 before, then the cell itself); ``waiting`` prints the same kind of line for
 anything else a cell needs. ``use_reference`` is the stuck switch that supplies
-a reference version of a function later cells use.
+a reference version of an answer later cells use.
 """
 
 import ast
@@ -24,9 +24,14 @@ import textwrap
 from functools import lru_cache
 
 import numpy as np
+import pandas as pd
+from scipy.special import logit
+from sklearn.exceptions import NotFittedError
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 
-from . import calibration, comparison, data, deployment, logistic, own_scores, reference, windows
-from .checks import RECOVERY, waiting  # noqa: F401  (re-exported for the notebooks)
+from . import calibration, comparison, data, deployment, features, own_scores, reference, windows
+from .checks import RECOVERY, show, waiting  # noqa: F401  (re-exported for the notebooks)
 
 WAITING = "Replace each ... with your answer and run the cell again."
 
@@ -70,6 +75,16 @@ def _placeholder_in_source(function):
 
 
 def _equal(actual, expected, rtol=1e-6):
+    if isinstance(expected, pd.DataFrame):
+        if not isinstance(actual, pd.DataFrame) or list(actual.shape) != list(expected.shape):
+            return False
+        return all(_equal(actual[c].to_numpy(), expected[c].to_numpy(), rtol)
+                   for c in expected.columns if c in actual.columns) and \
+            set(expected.columns) <= set(actual.columns)
+    if isinstance(expected, pd.Series):
+        expected = expected.to_numpy()
+    if isinstance(actual, pd.Series):
+        actual = actual.to_numpy()
     if isinstance(expected, dict):
         return (isinstance(actual, dict) and expected.keys() <= actual.keys()
                 and all(_equal(actual[k], v, rtol) for k, v in expected.items()))
@@ -127,456 +142,483 @@ def _case(args, expected, hint, accept=(), diagnose=(), rtol=1e-6):
             "diagnose": tuple(diagnose), "rtol": rtol}
 
 
-# --- Reference variants: valid alternatives and known mistakes ----------------
-
-
-def _summary(p, y, bins, sort_labels=True, brier="records"):
-    p, y = np.asarray(p, dtype=float), np.asarray(y, dtype=float)
-    order = np.argsort(p, kind="stable")
-    groups = np.array_split(order, bins)
-    labels = [y[g] if sort_labels else y[i * len(g):(i + 1) * len(g)] for i, g in enumerate(groups)]
-    value = {"records": np.mean((p - y) ** 2), "squared_mean": np.mean(p - y) ** 2}[brier]
-    return {"predicted": np.array([p[g].mean() for g in groups]),
-            "observed": np.array([lab.mean() for lab in labels]),
-            "n": np.array([len(g) for g in groups]), "brier": value}
-
-
-def _contribution(old, new, y, p_t, weight=None):
-    y = np.asarray(y, dtype=bool)
-    weight = p_t / (1 - p_t) if weight is None else weight
-    return ((np.asarray(new) >= p_t).astype(float) - (np.asarray(old) >= p_t)) * np.where(y, 1., -weight)
-
-
-def _bootstrap(old, new, y, p_t, resamples, seed, draw="rows", quantiles=(.025, .975), weight=None):
-    """The paired bootstrap, with one of several valid ways of drawing the indices."""
-    contribution = _contribution(old, new, y, p_t, weight)
-    n, rng = len(contribution), np.random.default_rng(seed)
-    if draw == "rows":
-        indices = rng.integers(0, n, size=(resamples, n))
-    elif draw == "columns":
-        indices = rng.integers(0, n, size=(n, resamples)).T
-    elif draw == "loop":
-        indices = np.array([rng.integers(0, n, n) for _ in range(resamples)])
-    elif draw == "choice":
-        indices = rng.choice(n, size=(resamples, n))
-    else:
-        indices = np.array([rng.choice(n, n) for _ in range(resamples)])
-    means = contribution[indices].mean(axis=1)
-    low, high = np.quantile(means, quantiles)
-    return {"estimate": contribution.mean(), "low": low, "high": high}
-
-
-def _unpaired_bootstrap(old, new, y, p_t, resamples, seed):
-    rng = np.random.default_rng(seed)
-    old, new, y = np.asarray(old), np.asarray(new), np.asarray(y, dtype=bool)
-    draws = []
-    for _ in range(resamples):
-        a, b = rng.integers(0, len(y), len(y)), rng.integers(0, len(y), len(y))
-        draws.append(comparison.policy_net_benefit(new[b], y[b], p_t)
-                     - comparison.policy_net_benefit(old[a], y[a], p_t))
-    low, high = np.quantile(draws, [.025, .975])
-    return {"estimate": comparison.policy_net_benefit(new, y, p_t)
-            - comparison.policy_net_benefit(old, y, p_t), "low": low, "high": high}
-
-
-def _changed(ids, old, new, y, p_t, strict=False, weight=None, any_change=False):
-    old, new = np.asarray(old), np.asarray(new)
-    a, b = (old > p_t, new > p_t) if strict else (old >= p_t, new >= p_t)
-    changed = (old != new) if any_change else (a != b)
-    price = p_t / (1 - p_t) if weight is None else weight
-    contribution = (b.astype(float) - a) * np.where(y, 1., -price)
-    return {"recording": np.asarray(ids)[changed], "direction": np.where(b[changed], "up", "down"),
-            "contribution": contribution[changed]}
-
-
-def _weighted_fit(X, y, w):
-    """Weighted logistic coefficients, intercept first, via integer replication of rows."""
-    model = logistic.fit_logistic_regression(np.repeat(X, w.astype(int), axis=0),
-                                             np.repeat(y, w.astype(int)))
-    return np.r_[model["intercept"], model["coefficients"]]
-
-
-def _queue(mean, rate, capacity, days, seed, loop=False, at_least=False):
-    rng = np.random.default_rng(seed)
-    if loop:
-        reviews = []
-        for _ in range(days):
-            arrivals = rng.poisson(mean)
-            reviews.append(rng.binomial(arrivals, rate))
-        reviews = np.array(reviews)
-    else:
-        reviews = rng.binomial(rng.poisson(mean, size=days), rate)
-    return float(np.mean(reviews >= capacity if at_least else reviews > capacity))
-
-
-def _platt_brier(splits, fit_split, assess_split):
-    fitted = calibration.platt_fit(splits[fit_split]["resnet"], splits[fit_split]["af_present"])
-    scores = calibration.platt_apply(splits[assess_split]["resnet"], fitted)
-    return calibration.brier_score(scores, splits[assess_split]["af_present"])
-
-
-def _repeat(p, costs, repeat_cost, q, se, sp, delay, variant="right"):
-    review = p * costs["TP"] + (1 - p) * costs["FP"]
-    accept = p * costs["FN"] + (1 - p) * costs["TN"]
-    readable = p * (se * costs["TP"] + (1 - se) * costs["FN"]) + (1 - p) * (
-        (1 - sp) * costs["FP"] + sp * costs["TN"])
-    fallback = accept if variant == "no_review_fallback" else review
-    once = repeat_cost + delay
-    if variant == "no_fallback":
-        repeat = once + q * readable
-    elif variant == "charged_twice":
-        repeat = once + q * (once + readable) + (1 - q) * (once + fallback)
-    else:
-        repeat = once + q * readable + (1 - q) * fallback
-    losses = {"review_now": review, "no_review_now": accept, "repeat": repeat}
-    return {**losses, "best": min(losses, key=losses.get)}
-
-
-def _recording_sensitivity(window_positive, af, rule):
-    return float(np.mean(rule(window_positive)[np.asarray(af, dtype=bool)]))
-
-
-@lru_cache(maxsize=1)
-def capacity_example():
-    """The mean-feasible cutoff at 5% prevalence, and Extension 4's prevalence answer."""
-    rows = []
-    for row in reference.sweep_thresholds(data.load_records("random_forest", "development"),
-                                          reference.DEFAULT_COSTS):
-        counts = reference.projected_counts(row, .05)
-        rows.append({"row": row, "reviews": counts["TP"] + counts["FP"],
-                     "loss": reference.matrix_loss(counts, reference.DEFAULT_COSTS)})
-    chosen = min((r for r in rows if r["reviews"] <= 50), key=lambda r: r["loss"])["row"]
-    grid = [k / 200 for k in range(2, 21)]
-    safe = []
-    for prevalence in grid:
-        counts = reference.projected_counts(chosen, prevalence)
-        if deployment.overflow_probability(counts["TP"] + counts["FP"], 50) <= .1:
-            safe.append(prevalence)
-    return {"threshold": chosen["threshold"], "grid": grid, "highest_safe": max(safe)}
-
-
-@lru_cache(maxsize=1)
-def cases():
-    """Small test inputs; full-cohort outputs are checked by the scenario tests."""
-    old = np.array([.1, .2, .8, .4, .6, .2])
-    new = np.array([.2, .1, .9, .1, .7, .2])
-    y = np.array([1, 1, 0, 0, 0, 1], dtype=bool)
-    p = .2
-    ids = np.array(["a", "b", "c", "d", "e", "f"])
-    splits = {split: data.load_arrays(split) for split in data.SPLITS}
-    cal, dev = splits["calibration"], splits["development"]
-    params = calibration.platt_fit(cal["resnet"], cal["af_present"])
-    probability_feature = logistic.fit_logistic_regression(cal["resnet"], cal["af_present"])
-    log_feature = logistic.fit_logistic_regression(np.log(cal["resnet"]), cal["af_present"])
-    rows = [dict(threshold=.1, reviews=70., loss=80., overflow=.5),
-            dict(threshold=.3, reviews=49., loss=90., overflow=.45),
-            dict(threshold=.5, reviews=35., loss=110., overflow=.03),
-            dict(threshold=.8, reviews=10., loss=170., overflow=.0)]
-    positive = np.array([[1, 0, 1, 0], [1, 1, 0, 0], [0, 0, 0, 0], [1, 1, 1, 0]], bool)
-    repeat_inputs = (.3, reference.DEFAULT_COSTS, .2, .8, .76, .95, .0)
-    weight_X = np.array([[-1., 0.], [0., 1.], [1., 0.], [0., -1.], [2., 1.], [-2., 1.]])
-    weight_y = np.array([0, 1, 1, 0, 0, 1])
-    weight_w = np.array([1., 3., 3., 1., 1., 3.])
-    capacity = capacity_example()
-    summary_p, summary_y = np.array([.8, .1, .6, .2]), np.array([1, 0, 1, 0])
-    review = np.array([True, True, True, False, False, False])
-    review_af = np.array([True, True, False, False, False, False])
-    calls = np.array([[1, 1, 0, 0], [0, 1, 0, 1], [1, 0, 0, 0], [0, 0, 0, 0]], bool)
-    calls_af = np.array([True, True, True, False])
-
-    def nb_winner(o, n, truth, cut):
-        a = comparison.policy_net_benefit(o, truth, cut)
-        b = comparison.policy_net_benefit(n, truth, cut)
-        return {"winner": "resnet" if b > a else "random_forest", "basis": "net_benefit",
-                "preference": cut}
-
-    return {
-        # Extension 1
-        "cal_summary": [
-            _case((summary_p, summary_y, 2), _summary(summary_p, summary_y, 2),
-                  "Sort scores and labels together, use equal-count bins, and square each "
-                  "residual before averaging.",
-                  diagnose=[(_summary(summary_p, summary_y, 2, brier="squared_mean"),
-                             "Square each recording's residual, then average. The square of the "
-                             "mean residual is not the Brier score."),
-                            (_summary(summary_p, summary_y, 2, sort_labels=False),
-                             "You sorted the scores but not the labels with them. Use one order, "
-                             "from np.argsort(p), for both.")]),
-            _case((np.array([.2, .8, .4]), np.array([0, 1, 1]), 2),
-                  {"predicted": np.array([.3, .8]), "observed": np.array([.5, 1.]),
-                   "n": np.array([2, 1]), "brier": (.04 + .04 + .36) / 3},
-                  "Brier uses every recording equally, not an unweighted mean of bin errors.")],
-        "cal_predict": [_case((), "same", "A positive Platt slope preserves order and ties, so "
-                              "every achievable policy, and the minimum loss, is unchanged. It "
-                              "changes the probabilities, not the ranking.")],
-        "cal_fit": [_case((cal["resnet"], cal["af_present"]), params,
-                          "Use log(p/(1 − p)) as the feature with an intercept column. The "
-                          "gradient is X.T @ (y − p) and the information is "
-                          "X.T @ ((p * (1 − p))[:, None] * X).",
-                          diagnose=[({"intercept": probability_feature["intercept"],
-                                      "slope": probability_feature["coefficients"][0]},
-                                     "Your feature is the probability itself. Regressing on the "
-                                     "probability is a legitimate calibration model, but it does "
-                                     "not implement the logit-linear specification used here, "
-                                     "which regresses on logit(score)."),
-                                    ({"intercept": log_feature["intercept"],
-                                      "slope": log_feature["coefficients"][0]},
-                                     "Your feature is log(p). The log-odds is log(p/(1 − p)).")],
-                          rtol=1e-5)],
-        "cal_split": [_case((splits,), _platt_brier(splits, "calibration", "evaluation"),
-                            "Fit the map on the calibration split and compute the Brier score on "
-                            "the evaluation split.",
-                            diagnose=[(_platt_brier(splits, "evaluation", "evaluation"),
-                                       "The map is still fitted on the recordings it is judged "
-                                       "on. That leaks the evaluation outcomes into the fit."),
-                                      (_platt_brier(splits, "calibration", "calibration"),
-                                       "That assesses the map on the recordings that fitted it. "
-                                       "Assess on the evaluation split."),
-                                      (_platt_brier(splits, "development", "evaluation"),
-                                       "Fit the map on the calibration split; the development "
-                                       "split is for choosing policies."),
-                                      (calibration.brier_score(splits["evaluation"]["resnet"],
-                                                               splits["evaluation"]["af_present"]),
-                                       "That is the raw ResNet's Brier score: the map is no "
-                                       "longer applied.")])],
-        "cal_shift": [_case((np.array([.1, .4]), .1, .02),
-                            calibration.recalibrate_in_the_large([.1, .4], .1, .02),
-                            "Add the new log-odds of prevalence minus the old; multiplying "
-                            "probabilities is not a prior shift.",
-                            diagnose=[(calibration.recalibrate_in_the_large([.1, .4], .02, .1),
-                                       "The shift runs the wrong way: add logit(new) − "
-                                       "logit(old), not the reverse."),
-                                      (np.array([.1, .4]) * .02 / .1,
-                                       "Multiplying probabilities by the prevalence ratio is not "
-                                       "a prior shift: shift the log-odds.")])],
-        # Extension 2
-        "cmp_predict": [_case((), "within_outcome", "Each NRI component uses its own "
-                              "outcome-group denominator, not the whole cohort.")],
-        "cmp_categorical": [
-            _case((old, new, y, p), comparison.categorical_nri(old, new, y, [p]),
-                  "Use >= at the cut; divide up-minus-down within AF and down-minus-up within "
-                  "non-AF."),
-            _case((np.array([.1, .2]), np.array([.2, .1]), np.array([True, False]), .2),
-                  {"event": 1., "non_event": 1., "total": 2.},
-                  "Use >= at the cut; a score equal to the threshold enters review.")],
-        "cmp_continuous": [_case((old, new, y), {"continuous": comparison.continuous_nri(old, new, y),
-                                                 "idi": comparison.idi(old, new, y)},
-                                 "Continuous NRI counts strict movements; IDI uses their "
-                                 "magnitudes. Ties count neither way.")],
-        "cmp_bootstrap": [_case(
-            (old, new, y, p, 200, 17), _bootstrap(old, new, y, p, 200, 17),
-            "Resample the same recording indices for both models and labels, and compute new "
-            "minus old NB using p_t/(1 − p_t).",
-            accept=[_bootstrap(old, new, y, p, 200, 17, draw) for draw in
-                    ("columns", "loop", "choice", "choice_loop")],
-            diagnose=[(_unpaired_bootstrap(old, new, y, p, 200, 17),
-                       "Resample the same recording indices for both models and labels: the "
-                       "comparison is paired."),
-                      (_bootstrap(old, new, y, p, 200, 17, quantiles=(.05, .95)),
-                       "That is a 90% interval. Take the 2.5th and 97.5th percentiles for 95%."),
-                      (_bootstrap(old, new, y, p, 200, 17, weight=p),
-                       "Weight a false positive by the odds p_t/(1 − p_t), not by p_t.")])],
-        "cmp_changed": [_case(
-            (ids, old, new, y, p),
-            {"recording": np.array(["a", "b", "d"]), "direction": np.array(["up", "down", "down"]),
-             "contribution": np.array([1., -1., .25])},
-            "Select only changes in review action, retain recording IDs, and price direction "
-            "using reference AF.",
-            diagnose=[(_changed(ids, old, new, y, p, any_change=True),
-                       "Include only recordings whose review action changes, not every "
-                       "recording whose score moved."),
-                      (_changed(ids, old, new, y, p, strict=True),
-                       "Use >= at the cut: a score equal to p_t enters review."),
-                      (_changed(ids, old, new, y, p, weight=1.),
-                       "Price a change for a recording without AF by p_t/(1 − p_t), not 1.")])],
-        "cmp_choice": [
-            _case((dev["random_forest"], dev["resnet"], dev["af_present"], .2),
-                  nb_winner(dev["random_forest"], dev["resnet"], dev["af_present"], .2),
-                  "Choose the winner by net benefit at the stated preference.",
-                  diagnose=[({"winner": "resnet", "basis": "nri", "preference": .2},
-                             "Positive NRI does not establish utility; compare net benefit at "
-                             "the stated preference.")]),
-            _case((np.array([.1, .1, .1, .1]), np.array([.3, .3, .3, .1]),
-                   np.array([True, True, False, False]), .2),
-                  {"winner": "resnet", "basis": "net_benefit", "preference": .2},
-                  "Compute the winner from the two net benefits; a fixed answer fails on other "
-                  "data.")],
-        # Extension 3
-        "weight_predict": [_case((), "intercept", "Positive class weights mostly shift the "
-                                 "intercept in this correctly specified example.")],
-        "weight_weights": [_case((np.array([1, 0, 0, 0]),), np.array([2., 2 / 3, 2 / 3, 2 / 3]),
-                                 "Balanced weights give each class equal total weight: "
-                                 "n/(2*n_class).",
-                                 diagnose=[(np.array([3., 1., 1., 1.]),
-                                            "Those weights have the right ratio but not the "
-                                            "balanced scale n/(2*n_class).")])],
-        "weight_fit": [_case((weight_X, weight_y, weight_w), _weighted_fit(weight_X, weight_y, weight_w),
-                             "Multiply both the gradient and the information by row_weights.",
-                             diagnose=[(_weighted_fit(weight_X, weight_y, np.ones(6)),
-                                        "row_weights do not reach the gradient, so this is the "
-                                        "unweighted fit. The gradient defines where the optimum "
-                                        "is.")],
-                             rtol=1e-5)],
-        "weight_optimum": [_case((np.array([.1, .2, .2, .8]), np.array([0, 1, 0, 1], bool),
-                                  reference.DEFAULT_COSTS), 3.,
-                                 "Sweep every distinct score plus review-all and review-none, "
-                                 "and charge TP reviews as well as FP.",
-                                 diagnose=[(1., "Charge correct reviews (TP) as well as false "
-                                                "positives.")])],
-        "weight_correct": [_case((np.array([.5, .9]), 9.),
-                                 logistic.sigmoid(logistic.logit([.5, .9]) - np.log(9)),
-                                 "Subtract log(weight ratio) from the log-odds, then apply the "
-                                 "sigmoid.",
-                                 diagnose=[(np.array([.5, .9]) / 9,
-                                            "Dividing the probability by the weight ratio is the "
-                                            "bug. Undo the weighting on the log-odds scale."),
-                                           (np.array([.5, .9]) - np.log(9),
-                                            "Subtract log(weight ratio) from the log-odds, not "
-                                            "from the probability."),
-                                           (logistic.sigmoid(logistic.logit([.5, .9]) + np.log(9)),
-                                            "Wrong direction: weighting AF up added log(w) to "
-                                            "the log-odds, so subtract it.")])],
-        # Extension 4
-        "queue_predict": [_case((), "sometimes", "Capacity bounds a daily count; a mean below it "
-                                "still allows random high-demand days.")],
-        "queue_counts": [_case((.8, .9, .05, 1000), {"TP": 40., "FN": 10., "FP": 95., "TN": 855.},
-                               "Apply sensitivity to AF recordings and the false-positive rate "
-                               "to non-AF recordings at the new prevalence.",
-                               diagnose=[({"TP": 40., "FN": 10., "FP": 100., "TN": 900.},
-                                          "The false-positive rate applies to recordings without "
-                                          "AF, population × (1 − prevalence), not to all "
-                                          "recordings.")])],
-        "queue_select": [_case((rows, 50.), .3, "Filter by expected reviews before minimising "
-                               "loss; the unconstrained optimum is infeasible.")],
-        "queue_simulate": [
-            _case((1000, .0497, 50, 365, 19), _queue(1000, .0497, 50, 365, 19),
-                  "Draw Poisson arrivals, then binomial reviews, and return the fraction of days "
-                  "with reviews strictly above capacity.",
-                  accept=[_queue(1000, .0497, 50, 365, 19, loop=True)],
-                  diagnose=[(_queue(1000, .0497, 50, 365, 19, at_least=True),
-                             "A day exactly at capacity is not overflow: use >, not >=."),
-                            (_queue(1000, .0497, 50, 365, 19, loop=True, at_least=True),
-                             "A day exactly at capacity is not overflow: use >, not >=.")]),
-            _case((5, 1., 5, 400, 5), _queue(5, 1., 5, 400, 5),
-                  "A day exactly at capacity is not overflow; use strictly greater than.",
-                  accept=[_queue(5, 1., 5, 400, 5, loop=True)])],
-        "queue_tolerance": [_case((rows, .1), .5, "Filter by the stated overflow tolerance, then "
-                                  "minimise loss.",
-                                  diagnose=[(.3, "That is the mean-feasible policy. A mean "
-                                                 "within capacity is not acceptable daily "
-                                                 "service: filter on overflow."),
-                                            (.1, "Filter on overflow before minimising loss; "
-                                                 "the cheapest policy overflows on half the "
-                                                 "days.")])],
-        "queue_prevalence": [_case((), capacity["highest_safe"],
-                                   "Keep the Problem C cutoff fixed, project its reviews at each "
-                                   "prevalence on the grid, and keep the highest prevalence whose "
-                                   "overflow probability is at most 10%.",
-                                   diagnose=[(.05, "At the planning prevalence the overflow "
-                                                   "probability is far above 10%. Go lower."),
-                                             (100 * capacity["highest_safe"],
-                                              "Give the prevalence as a proportion, not a "
-                                              "percentage."),
-                                             (capacity["highest_safe"] + .005,
-                                              "That is the first prevalence that breaks the "
-                                              "tolerance. Keep the last one that meets it.")])],
-        # Extension 5
-        "window_predict": [_case((), "no", "One recording label cannot tell which windows contain "
-                                 "AF; interval truth is needed.")],
-        "window_rules": [_case((positive, 2), {"any": positive.any(axis=1),
-                                               "majority": positive.sum(axis=1) > 2,
-                                               "count": positive.sum(axis=1) >= 2},
-                               "Reduce across windows within each recording; majority is strictly "
-                               "more than half and count includes equality.")],
-        "window_persistence": [
-            _case((positive, 2), np.array([False, True, False, True]),
-                  "Reset the run after every negative window; separated positives do not "
-                  "establish persistence."),
-            _case((np.array([[1, 0, 1], [1, 1, 1]], bool), 3), np.array([False, True]),
-                  "Reset the run after a negative and include a run ending at the last window.")],
-        "window_counts": [
-            _case((review, review_af), {"TP": 2, "FP": 1, "FN": 0, "TN": 3},
-                  "Count recording decisions against recording truth, one cell per recording.",
-                  diagnose=[({"TP": 2, "FP": 0, "FN": 1, "TN": 3},
-                             "FP and FN are swapped: FP is a review without AF; FN is AF without "
-                             "review."),
-                            ({"TP": 2, "FP": 1, "FN": 3, "TN": 0},
-                             "FN and TN are swapped: FN is AF without review; TN is neither.")]),
-            _case((np.array([True, False, True, False]), np.array([True, True, False, False])),
-                  {"TP": 1, "FP": 1, "FN": 1, "TN": 1},
-                  "Count recording decisions against recording truth; use logical complements.")],
-        "window_sensitivity": [
-            _case((calls, calls_af, windows.any_positive),
-                  _recording_sensitivity(calls, calls_af, windows.any_positive),
-                  "Apply the rule to get one decision per recording, then take the fraction of "
-                  "AF recordings reviewed.",
-                  diagnose=[(calls[calls_af].sum() / calls_af.sum(),
-                             "That counts positive windows, not reviewed recordings, so it can "
-                             "exceed 1. Apply the rule first."),
-                            (calls[calls_af].mean(),
-                             "That is a window-level rate. The unit of analysis is the "
-                             "recording: apply the rule first.")]),
-            _case((calls, calls_af, windows.persistence(2)),
-                  _recording_sensitivity(calls, calls_af, windows.persistence(2)),
-                  "Use the rule passed in, not any-positive.",
-                  diagnose=[(_recording_sensitivity(calls, calls_af, windows.any_positive),
-                             "Use the rule passed in; this answer applies any-positive.")])],
-        "window_repeat": [
-            _case(repeat_inputs, _repeat(*repeat_inputs),
-                  "Pay repeat and delay once, and weight the readable and unreadable branches by "
-                  "q and 1 − q.",
-                  diagnose=[(_repeat(*repeat_inputs, variant="no_fallback"),
-                             "You left out the unreadable branch: with probability 1 − q the "
-                             "repeat fails and the fallback, review, applies."),
-                            (_repeat(*repeat_inputs, variant="no_review_fallback"),
-                             "The fallback here is review, priced p·C_TP + (1 − p)·C_FP."),
-                            (_repeat(*repeat_inputs, variant="charged_twice"),
-                             "Charge the repeat and delay once, not again inside each branch.")]),
-            _case((.3, reference.DEFAULT_COSTS, .2, 0., .76, .95, .1),
-                  {"review_now": 1., "no_review_now": 1.5, "repeat": 1.3, "best": "review_now"},
-                  "If no repeats are readable, everyone reaches the fallback and still pays "
-                  "acquisition and delay.")],
-    }
-
-
-# --- Extension 6: checks that read the learner's own data ---------------------
-# Each returns (state, problem). state is True while the answer is unfinished,
-# False once it can be judged, or UNAVAILABLE when the learner's data cannot
-# support the check; problem None means correct.
-
 UNAVAILABLE = "unavailable"
-JOIN_SCORES = [{"recording": "A00001", "score": .2}, {"recording": "A00004", "score": .9},
-               {"recording": "A00002", "score": .4}, {"recording": "A00002", "score": .5},
-               {"recording": "Z99999", "score": .3}, {"recording": "A00003", "score": 1.4},
-               {"recording": "A00005", "score": float("nan")}, {"recording": "A00006", "score": .7},
-               {"recording": "A00007", "score": .1}]
-JOIN_LABELS = {"A00001": "N", "A00002": "N", "A00003": "A", "A00004": "A", "A00005": "O",
-               "A00006": "~", "A00007": "O"}
-JOIN_EXPECTED = {"records": [{"recording": "A00001", "score": .2, "af_present": False},
-                             {"recording": "A00004", "score": .9, "af_present": True},
-                             {"recording": "A00007", "score": .1, "af_present": False}],
-                 "duplicates": ["A00002"], "unknown": ["Z99999"],
-                 "out_of_range": ["A00003", "A00005"], "noise": 1}
-NO_DEVELOPMENT = ("There are no development recordings among your joined scores. Finish Problem A "
-                  "(or use its stuck switch), or bring scores for recordings in the development "
-                  "split.")
+COSTS = reference.DEFAULT_COSTS
+UNUSUAL_COSTS = {"TP": 2.0, "FP": 3.0, "FN": 11.0, "TN": 0.5}
 
 
-def _is_false(value):
-    """False as a value: Python's False or numpy's False, not 0 or None."""
-    return isinstance(value, (bool, np.bool_)) and not bool(value)
+def _split(name):
+    frame = data.load_scores()
+    return frame[frame["split"] == name].reset_index(drop=True)
+
+
+def _call(function, *args):
+    """(result, error) of learner code, with its warnings silenced."""
+    import contextlib
+    import io
+    import warnings
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return function(*args), None
+    except Exception as error:
+        return None, error
+
+
+def _table_problem(actual, columns, what="table"):
+    if not isinstance(actual, pd.DataFrame):
+        return f"Return a pandas DataFrame; received {_kind(actual)}."
+    missing = [c for c in columns if c not in actual.columns]
+    if missing:
+        return f"The {what} has no column {', '.join(map(repr, missing))}."
+    return None
+
+
+# --- Small fixed inputs -------------------------------------------------------------
+
+
+@lru_cache(maxsize=1)
+def _fixtures():
+    development, calibration_split, evaluation = (_split(s) for s in
+                                                   ("development", "calibration", "evaluation"))
+    # Two AF recordings and five without, with unequal up and down moves in each group, so
+    # that a wrong denominator or a swapped direction gives a different answer.
+    old = np.array([.1, .2, .8, .4, .6, .1, .3])
+    new = np.array([.3, .1, .9, .1, .7, .5, .1])
+    y = np.array([1, 1, 0, 0, 0, 0, 0], dtype=bool)
+    rhythm = features.synthetic_rhythm_features()
+    parts = {s: rhythm[rhythm["split"] == s].reset_index(drop=True)
+             for s in ("train", "validation", "test")}
+    window_positive = np.array([[1, 0, 1, 0], [1, 1, 0, 0], [0, 0, 0, 0], [1, 1, 1, 0]], bool)
+    window_valid = np.array([[1, 1, 1, 1], [1, 1, 1, 0], [1, 1, 1, 1], [1, 1, 1, 1]], bool)
+    return {"development": development, "calibration": calibration_split,
+            "evaluation": evaluation, "old": old, "new": new, "y": y, "rhythm": parts,
+            "window_positive": window_positive, "window_valid": window_valid}
+
+
+@lru_cache(maxsize=1)
+def _platt_reference():
+    fitting = _fixtures()["calibration"]
+    return calibration.platt().fit(fitting[["resnet"]], fitting["af"])
+
+
+@lru_cache(maxsize=1)
+def _isotonic_reference():
+    fitting = _fixtures()["calibration"]
+    return IsotonicRegression(out_of_bounds="clip", y_min=0, y_max=1).fit(fitting["resnet"],
+                                                                           fitting["af"])
+
+
+def _compare_on(frame, fit_split, assess_split="development"):
+    """Brier scores on ``assess_split`` of the Platt and isotonic maps, both fitted on ``fit_split``."""
+    from sklearn.metrics import brier_score_loss
+    fitting, assessed = frame[frame["split"] == fit_split], frame[frame["split"] == assess_split]
+    platt = calibration.platt().fit(fitting[["resnet"]], fitting["af"])
+    isotonic = IsotonicRegression(out_of_bounds="clip").fit(fitting["resnet"], fitting["af"])
+    return {"platt": float(brier_score_loss(assessed["af"],
+                                            platt.predict_proba(assessed[["resnet"]])[:, 1])),
+            "isotonic": float(brier_score_loss(assessed["af"], isotonic.predict(assessed["resnet"])))}
+
+
+def _compare_reference(frame):
+    return _compare_on(frame, "calibration", "development")
+
+
+# --- Custom checks: (state, problem); state True means not attempted ---------------
+
+
+def _fitted_probabilities(name, model, X, columns_hint):
+    if model is Ellipsis:
+        return None, (True, WAITING)
+    method = "predict_proba" if hasattr(model, "predict_proba") else "predict"
+    if not hasattr(model, method):
+        return None, (False, f"Expected a fitted scikit-learn model; received {_kind(model)}.")
+    got, error = _call(lambda: getattr(model, method)(X))
+    if isinstance(error, NotFittedError):
+        return None, (False, "The model is not fitted yet: call .fit(...) on the calibration split.")
+    if error is not None:
+        return None, (False, f"{method} raised {type(error).__name__}: {error}. {columns_hint}")
+    got = np.asarray(got, dtype=float)
+    return (got[:, 1] if got.ndim == 2 else got), None
+
+
+def _cal_report(function):
+    if not callable(function):
+        return False, "Expected your calibration_report function."
+    fx = _fixtures()
+    for column in ("random_forest", "resnet"):
+        y, p = fx["development"]["af"], fx["development"][column]
+        got, error = _call(function, y, p)
+        if error is not None:
+            return False, f"It raised {type(error).__name__}: {error}."
+        if _unfinished(got):
+            return True, WAITING
+        expected = calibration.calibration_report(y, p)
+        shape = _shape_problem(got, {k: 0.0 for k in ("brier", "observed", "predicted",
+                                                     "intercept", "slope")})
+        if shape:
+            return False, shape
+        if not _equal(got["brier"], expected["brier"]):
+            return False, "Use brier_score_loss(y, p): the mean squared difference over recordings."
+        if _equal(got["observed"], expected["predicted"]) and _equal(got["predicted"],
+                                                                      expected["observed"]):
+            return False, ("calibration_curve returns (prob_true, prob_pred): the observed AF "
+                           "fraction first, then the mean stated probability.")
+        if not (_equal(got["observed"], expected["observed"])
+                and _equal(got["predicted"], expected["predicted"])):
+            return False, ("Use calibration_curve(y, p, n_bins=10, strategy='quantile') for "
+                           "equal-count bins.")
+        if not _equal(got["intercept"], expected["intercept"], 1e-5):
+            from statsmodels.api import GLM, add_constant, families
+            z = logit(np.asarray(p, dtype=float))
+            free = GLM(np.asarray(y, float), add_constant(z), family=families.Binomial()).fit()
+            if _equal(got["intercept"], float(np.asarray(free.params)[0]), 1e-5):
+                return False, ("That intercept comes from the fit with a free slope. "
+                               "Calibration-in-the-large fixes the slope at 1: fit an intercept "
+                               "only, with logit(p) as an offset.")
+            return False, ("Fit logit P(AF) = a + logit(p): a binomial GLM with a column of ones "
+                           "and offset=logit(p).")
+        if not _equal(got["slope"], expected["slope"], 1e-5):
+            from statsmodels.api import GLM, families
+            origin = GLM(np.asarray(y, float), logit(np.asarray(p, dtype=float))[:, None],
+                         family=families.Binomial()).fit()
+            if _equal(got["slope"], float(np.asarray(origin.params)[0]), 1e-5):
+                return False, "The slope fit needs an intercept too: use add_constant(logit(p))."
+            return False, "Fit logit P(AF) = a + b·logit(p) and report b."
+    return False, None
+
+
+def _cal_platt(model):
+    fx = _fixtures()
+    got, problem = _fitted_probabilities("platt_map", model, fx["evaluation"][["resnet"]],
+                                         "Fit on a one-column DataFrame, calibration_split[['resnet']].")
+    if problem:
+        return problem
+    expected = _platt_reference().predict_proba(fx["evaluation"][["resnet"]])[:, 1]
+    if np.allclose(got, expected, atol=5e-4, rtol=0):
+        return False, None
+    X_cal, y_cal = fx["calibration"][["resnet"]], fx["calibration"]["af"]
+    variants = [
+        (LogisticRegression(solver="newton-cholesky").fit(logit(X_cal), y_cal).predict_proba(
+            logit(fx["evaluation"][["resnet"]]))[:, 1],
+         "LogisticRegression shrinks its coefficients by default (C=1). Use C=np.inf."),
+        (LogisticRegression(C=np.inf, solver="newton-cholesky").fit(X_cal, y_cal).predict_proba(
+            fx["evaluation"][["resnet"]])[:, 1],
+         "This regresses on the raw score. Platt scaling uses logit(score): put "
+         "FunctionTransformer(logit) before the logistic regression."),
+    ]
+    for split in ("development", "evaluation"):
+        frame = fx[split]
+        variants.append((calibration.platt().fit(frame[["resnet"]], frame["af"]).predict_proba(
+            fx["evaluation"][["resnet"]])[:, 1],
+            f"This map was fitted on the {split} split. Fit it on the calibration split only."))
+    for i, (wrong, hint) in enumerate(variants):
+        # The raw-score fit (second) is far from the answer, and solvers disagree more on it.
+        if np.allclose(got, wrong, atol=2e-3 if i == 1 else 5e-4, rtol=0):
+            return False, hint
+    return False, "Fit logit(resnet) against AF on the calibration split, with no penalty."
+
+
+def _cal_isotonic(model):
+    fx = _fixtures()
+    got, problem = _fitted_probabilities("isotonic_map", model, fx["evaluation"]["resnet"],
+                                         "Fit and predict on the score column itself.")
+    if problem:
+        return problem
+    if np.isnan(got).any():
+        return False, ("Some evaluation scores lie outside the calibration scores' range and get "
+                       "NaN. Set out_of_bounds='clip'.")
+    expected = _isotonic_reference().predict(fx["evaluation"]["resnet"])
+    if np.allclose(got, expected, atol=1e-9):
+        return False, None
+    for split in ("development", "evaluation"):
+        frame = fx[split]
+        wrong = IsotonicRegression(out_of_bounds="clip").fit(frame["resnet"], frame["af"]).predict(
+            fx["evaluation"]["resnet"])
+        if np.allclose(got, wrong, atol=1e-9):
+            return False, f"This map was fitted on the {split} split. Fit it on calibration only."
+    return False, "Fit IsotonicRegression(out_of_bounds='clip') on the calibration split's resnet scores."
+
+
+def _cal_leak(function):
+    if not callable(function):
+        return False, "Expected your compare_recalibrations function."
+    frame = data.load_scores()
+    got, error = _call(function, frame)
+    if error is not None:
+        return False, f"It raised {type(error).__name__}: {error}."
+    if _unfinished(got):
+        return True, WAITING
+    shape = _shape_problem(got, {"platt": 0.0, "isotonic": 0.0})
+    if shape:
+        return False, shape
+    # Brier scores are compared at 1e-4: solvers at their default tolerances differ by about 1e-6.
+    if _equal(got, _compare_reference(frame), 1e-4):
+        return False, None
+    if _equal(got, _compare_on(frame, "evaluation", "evaluation"), 1e-4):
+        return False, ("Both maps are still fitted on the evaluation recordings they are judged "
+                       "on. The flexible isotonic map gains most from that, which is why it looked "
+                       "better.")
+    if _equal(got, _compare_on(frame, "calibration", "evaluation"), 1e-4):
+        return False, ("The maps are now fitted honestly, but the choice is still made on the "
+                       "evaluation split. Choose on development; evaluation only reports the "
+                       "frozen choice.")
+    if _equal(got, _compare_on(frame, "development", "development"), 1e-4):
+        return False, "Fit the maps on the calibration split, not development."
+    return False, ("Fit both maps on the calibration split, then compare their Brier scores on the "
+                   "development split.")
+
+
+def _cmp_bootstrap(function):
+    if not callable(function):
+        return False, "Expected your delta_net_benefit function."
+    fx = _fixtures()
+    d = fx["development"]
+    y, old_review, new_review = d["af"].to_numpy(), (d["random_forest"] >= .2).to_numpy(), \
+        (d["resnet"] >= .2).to_numpy()
+    got, error = _call(function, y, old_review, new_review, .2)
+    if error is not None:
+        return False, f"It raised {type(error).__name__}: {error}."
+    if _unfinished(got):
+        return True, WAITING
+    expected = comparison.delta_net_benefit(y, old_review, new_review, .2)
+    shape = _shape_problem(got, {"estimate": 0.0, "low": 0.0, "high": 0.0})
+    if shape:
+        return False, shape
+    if not _equal(got["estimate"], expected["estimate"]):
+        weight_p = np.mean((new_review.astype(float) - old_review) * np.where(y, 1, -.2))
+        if _equal(got["estimate"], weight_p):
+            return False, "Weight a false referral by the odds p_t/(1 - p_t), not by p_t."
+        return False, "The estimate is the mean of the per-recording contributions, new minus old."
+    width = expected["high"] - expected["low"]
+    if not all(abs(got[k] - expected[k]) <= .1 * width for k in ("low", "high")):
+        if got["high"] - got["low"] > 1.3 * width:
+            return False, ("The interval is too wide: resample the recordings with both models' "
+                           "decisions together (paired=True).")
+        return False, ("Use scipy.stats.bootstrap with paired=True, method='percentile' and the "
+                       "default 95% level.")
+    return False, None
+
+
+CHANGED_COLUMNS = ("recording", "reference_label", "direction", "contribution")
+
+
+def _cmp_changed(function):
+    if not callable(function):
+        return False, "Expected your changed_decisions function."
+    d = _fixtures()["development"]
+    got, error = _call(function, d, "random_forest", "resnet", .2, .2)
+    if error is not None:
+        return False, f"It raised {type(error).__name__}: {error}."
+    if _unfinished(got):
+        return True, WAITING
+    problem = _table_problem(got, CHANGED_COLUMNS)
+    if problem:
+        return False, problem
+    expected = comparison.changed_decisions(d, "random_forest", "resnet", .2, .2)
+    if len(got) != len(expected):
+        moved = int((d["resnet"] != d["random_forest"]).sum())
+        if len(got) == moved:
+            return False, ("Keep only recordings whose review decision changes, not every recording "
+                           "whose score moved.")
+        return False, (f"Expected {len(expected)} changed recordings, received {len(got)}. Review "
+                       "when the score is at or above the cut (>=).")
+    got = got.reset_index(drop=True)
+    if list(got["recording"]) != list(expected["recording"]):
+        return False, "Keep the recordings in input order."
+    if list(got["direction"]) != list(expected["direction"]):
+        return False, "'up' means the new model reviews a recording that the old one did not."
+    for column in ("random_forest", "resnet"):
+        if column not in got.columns or not _equal(got[column], expected[column]):
+            return False, f"Keep the score column {column!r}, unchanged, for each changed recording."
+    if list(got["reference_label"]) != list(expected["reference_label"]):
+        return False, "Keep each recording's reference label (A, N or O) from the frame."
+    if not _equal(got["contribution"], expected["contribution"]):
+        return False, ("An AF recording that moves up contributes +1, and one without AF that "
+                       "moves up contributes -p_t/(1 - p_t); moving down reverses the sign.")
+    return False, None
+
+
+def _cmp_preference(function):
+    if not callable(function):
+        return False, "Expected your compare_net_benefit function."
+    d = _fixtures()["development"]
+    cutoffs = {m: float(reference.cheapest(reference.operating_points(d["af"], d[m], COSTS))["threshold"])
+               for m in ("random_forest", "resnet")}
+    got, error = _call(function, d, cutoffs, .2)
+    if error is not None:
+        return False, f"It raised {type(error).__name__}: {error}."
+    if _unfinished(got):
+        return True, WAITING
+    expected = comparison.compare_net_benefit(d, cutoffs, .2)
+    shape = _shape_problem(got, {k: 0.0 for k in expected})
+    if shape:
+        return False, shape
+    if _equal(got, expected):
+        return False, None
+    return False, ("Value every model's decisions at the service's preference p_t. Each cutoff "
+                   "decides who is reviewed; p_t alone sets the weight of a false referral.")
+
+
+def _weight_fit(function):
+    if not callable(function):
+        return False, "Expected your fit_models function."
+    train = _fixtures()["rhythm"]["train"]
+    got, error = _call(function, train)
+    if error is not None:
+        return False, f"It raised {type(error).__name__}: {error}."
+    if _unfinished(got):
+        return True, WAITING
+    shape = _shape_problem(got, {"unweighted": 0.0, "weighted": 0.0})
+    if shape and not isinstance(got, dict):
+        return False, shape
+    if not isinstance(got, dict) or set(got) < {"unweighted", "weighted"}:
+        return False, "Return a dictionary with the keys 'unweighted' and 'weighted'."
+    expected = features.fit_models(train)
+    X = train[list(features.FEATURES)]
+    for key in ("unweighted", "weighted"):
+        model = got[key]
+        if not hasattr(model, "predict_proba"):
+            return False, f"'{key}' should be a fitted LogisticRegression."
+        probability, error = _call(lambda m=model: m.predict_proba(X)[:, 1])
+        if error is not None:
+            return False, f"'{key}' could not predict: {type(error).__name__}: {error}."
+        if not np.allclose(probability, expected[key].predict_proba(X)[:, 1], atol=1e-3):
+            weights = "balanced" if key == "weighted" else None
+            penalised = LogisticRegression(class_weight=weights, solver="newton-cholesky").fit(X, train["af"])
+            if np.allclose(probability, penalised.predict_proba(X)[:, 1], atol=1e-3):
+                return False, ("This fit keeps scikit-learn's default L2 penalty (C=1). Class weights "
+                               "rescale the log-likelihood, so they would also change how hard "
+                               "the coefficients are shrunk. Switch the penalty off with "
+                               "C=np.inf.")
+            if key == "weighted":
+                return False, ("Give the weighted model class_weight='balanced', so both classes "
+                               "carry the same total weight.")
+            return False, ("Fit the unweighted model with LogisticRegression(C=np.inf, "
+                           "solver=\"newton-cholesky\") on the training rows.")
+    return False, None
+
+
+REPORT_TABLE = ("cutoff", "reviews", "af_detected", "af_missed", "loss")
+
+
+def _report_problem(got, models, parts):
+    """None when each cutoff attains the minimum validation loss and its row reports its test results.
+
+    Always semantic: the decisions the submitted cutoff makes are computed on the
+    validation rows (they must attain the minimum loss there) and on the test
+    rows (the reported columns must be what they give). A cutoff that merely
+    looks close to the reference is not enough; an equivalent or tied one is.
+    """
+    X = list(features.FEATURES)
+    cutoffs = {}
+    for name in models:
+        try:
+            cutoffs[name] = float(got.loc[name, "cutoff"])
+        except (TypeError, ValueError, KeyError):
+            return f"The cutoff for {name} should be one number."
+    for name, model in models.items():
+        cutoff = cutoffs[name]
+        validation_p = model.predict_proba(parts["validation"][X])[:, 1]
+        best = reference.cheapest(reference.operating_points(parts["validation"]["af"], validation_p,
+                                                             COSTS))["loss"]
+        attained = reference.policy_cost(parts["validation"]["af"], validation_p >= cutoff, COSTS)
+        if not math.isclose(attained, best, rel_tol=1e-9):
+            if all(math.isclose(c, .5) for c in cutoffs.values()):
+                return ("predict() still applies its default boundary of 0.5 to both models. "
+                        "Threshold predict_proba(X)[:, 1] at each model's cutoff, chosen on "
+                        "validation.")
+            return (f"On the validation rows the cutoff given for {name} has loss {attained:g}, not "
+                    f"the minimum {best:g}. Choose each model's cutoff on validation by loss, and use "
+                    "the threshold as it is, not rounded.")
+        review = model.predict_proba(parts["test"][X])[:, 1] >= cutoff
+        c, n = reference.counts(parts["test"]["af"], review), len(parts["test"])
+        actual = {"reviews": 1000 * (c["TP"] + c["FP"]) / n, "af_detected": 1000 * c["TP"] / n,
+                  "af_missed": 1000 * c["FN"] / n,
+                  "loss": reference.policy_cost(parts["test"]["af"], review, COSTS)}
+        for key, value in actual.items():
+            reported = pd.to_numeric(pd.Series([got.loc[name, key]]), errors="coerce").iloc[0]
+            if not _equal(reported, value):
+                return (f"Column {key!r} differs for {name}: on the test rows that cutoff gives "
+                        f"{value:g}. Report its consequences on the test rows per 1,000.")
+    return None
+
+
+def _weight_report(function):
+    if not callable(function):
+        return False, "Expected your test_report function."
+    parts = _fixtures()["rhythm"]
+    models = features.fit_models(parts["train"])
+    got, error = _call(function, models, parts["validation"], parts["test"], COSTS)
+    if error is not None:
+        return False, f"It raised {type(error).__name__}: {error}."
+    if _unfinished(got):
+        return True, WAITING
+    problem = _table_problem(got, REPORT_TABLE)
+    if problem:
+        return False, problem
+    try:
+        got = got.loc[list(models)]
+    except KeyError:
+        return False, "Index the table by model name, as the original does."
+    return False, _report_problem(got, models, parts)
+
+
+def _weight_tuned(model):
+    """A fitted TunedThresholdClassifierCV whose objective is the priced loss."""
+    if model is Ellipsis:
+        return True, WAITING
+    if not hasattr(model, "best_threshold_") or not hasattr(model, "scoring"):
+        return False, ("Expected a fitted TunedThresholdClassifierCV; it has best_threshold_ after "
+                       ".fit(...).")
+    train = _fixtures()["rhythm"]["train"]
+    X, y = train[list(features.FEATURES)], train["af"]
+    predicted, error = _call(model.predict, X)
+    if error is not None:
+        return False, f"predict raised {type(error).__name__}: {error}. Fit it on the training rows."
+    from sklearn.metrics import get_scorer
+    scorer = get_scorer(model.scoring) if isinstance(model.scoring, str) else model.scoring
+    if scorer is None:
+        return False, ("Give the tuner a scoring argument built from policy_cost; without one it "
+                       "maximises balanced accuracy, which ignores the prices.")
+    score, error = _call(scorer, model, X, y)
+    if error is not None:
+        return False, f"Its scorer could not be applied: {type(error).__name__}: {error}."
+    loss = reference.policy_cost(y, np.asarray(predicted, dtype=bool), COSTS)
+    if math.isclose(score, loss, rel_tol=1e-9):
+        return False, ("The tuner maximised the loss. Build the scorer with "
+                       "make_scorer(policy_cost, greater_is_better=False, costs=costs).")
+    if not math.isclose(score, -loss, rel_tol=1e-9):
+        return False, ("Its objective is not the priced loss: score with make_scorer(policy_cost, "
+                       "greater_is_better=False, costs=costs).")
+    fixed = reference.policy_cost(y, model.estimator_.predict_proba(X)[:, 1] >= .5, COSTS)
+    if loss > fixed:
+        return False, ("The tuned threshold costs more on the training rows than 0.5 does, so the "
+                       "tuning did not minimise the loss. Check the scorer and the estimator.")
+    return False, None
 
 
 def _own_join(function):
     if not callable(function):
         return False, "Expected your join_scores function."
-    result = function([dict(row) for row in JOIN_SCORES], dict(JOIN_LABELS))
-    if _unfinished(result):
+    got, error = _call(function, JOIN_SCORES.copy(), JOIN_LABELS.copy())
+    if error is not None:
+        return False, f"It raised {type(error).__name__}: {error}."
+    if _unfinished(got):
         return True, WAITING
-    shape = _shape_problem(result, JOIN_EXPECTED)
-    if shape:
+    shape = _shape_problem(got, {"records": 0.0, "duplicates": 0.0, "unknown": 0.0,
+                                 "out_of_range": 0.0, "noise": 0.0})
+    if shape and not isinstance(got, dict):
         return False, shape
-    kept = {r.get("recording"): r for r in result["records"] if isinstance(r, dict)}
+    keys = ("records", "duplicates", "unknown", "out_of_range", "noise")
+    missing = [k for k in keys if not isinstance(got, dict) or k not in got]
+    if missing:
+        return False, f"The result has no {', '.join(map(repr, missing))}. Use the keys {keys}."
+    records = got["records"]
+    problem = _table_problem(records, ("recording", "score", "af"), "'records' table")
+    if problem:
+        return False, problem
+    kept = dict(zip(records["recording"], records["af"]))
     if "A00006" in kept:
         return False, ("A noise recording (~) has no binary AF reference. Exclude it and count it "
                        "in 'noise'; do not keep it as a recording without AF.")
@@ -584,108 +626,367 @@ def _own_join(function):
         return False, ("A00002 appears twice with different scores. Exclude every copy of a "
                        "duplicated ID and list the ID once in 'duplicates'.")
     if "A00003" in kept or "A00005" in kept:
-        return False, ("Scores must be finite and between 0 and 1. List the others in "
-                       "'out_of_range'; a NaN score fails both comparisons.")
-    if "A00007" in kept and not _is_false(kept["A00007"].get("af_present")):
+        return False, ("Scores must be between 0 and 1. List the others in 'out_of_range'; a NaN "
+                       "score is not between 0 and 1 either.")
+    if "A00007" in kept and bool(kept["A00007"]):
         return False, "Only reference label A is AF. N and O are AF-negative."
+    expected = own_scores.join_scores(JOIN_SCORES, JOIN_LABELS)
     for key in ("duplicates", "unknown", "out_of_range"):
-        if list(result[key]) != JOIN_EXPECTED[key]:
-            return False, (f"'{key}' should be {JOIN_EXPECTED[key]}, received {list(result[key])}. "
-                           "Check each row in the stated order: duplicate, unknown, out of range, "
-                           "noise.")
-    if result["noise"] != JOIN_EXPECTED["noise"]:
+        if list(got[key]) != expected[key]:
+            return False, (f"'{key}' should be {expected[key]}, received {list(got[key])}. Check "
+                           "each row in the stated order: duplicate, unknown, out of range, noise.")
+    if got["noise"] != expected["noise"]:
         return False, "Count the noise recordings you excluded in 'noise'."
-    if not _equal(result["records"], JOIN_EXPECTED["records"]):
-        return False, ("Keep the remaining rows in input order as dictionaries with 'recording', "
-                       "'score' and 'af_present'.")
+    got_records = records.reset_index(drop=True)
+    if (list(got_records["recording"]) != list(expected["records"]["recording"])
+            or not _equal(got_records["score"], expected["records"]["score"])
+            or list(map(bool, got_records["af"])) != list(expected["records"]["af"])):
+        return False, "Keep the remaining rows in input order with recording, score and af."
     return False, None
 
 
-def _relation(j, loss):
-    return "lower" if j < loss else "higher" if j > loss else "same"
+NO_DEVELOPMENT = ("There are no development recordings among your joined scores. Finish Problem A "
+                  "(or use its stuck switch), or bring scores for recordings in the development "
+                  "split.")
 
 
-def _own_j(answer, development):
-    if answer is Ellipsis:
+def _own_freeze(frozen, development):
+    """Both cutoffs frozen on development, with supported prices; evaluation is never read.
+
+    ``stated`` must be the threshold the prices imply, and ``optimum`` must make
+    the development minimum-loss decisions (any equivalent or tied cutoff).
+    """
+    if _unfinished(frozen):
         return True, WAITING
-    if answer not in ("lower", "higher", "same"):
-        return False, "Answer 'lower', 'higher' or 'same'."
-    if not development:
-        return UNAVAILABLE, NO_DEVELOPMENT
-    n_pos = sum(r["af_present"] for r in development)
-    if n_pos in (0, len(development)):
-        return UNAVAILABLE, (f"Every development recording {'has' if n_pos else 'lacks'} AF, so "
-                             f"{'specificity' if n_pos else 'sensitivity'}, and therefore J, is "
-                             "undefined. There is nothing to compare.")
-    rows = reference.sweep_thresholds(development, reference.DEFAULT_COSTS)
-    j_cuts = [r["threshold"] for r in reference.best_thresholds(rows, "youden_j", minimise=False)]
-    loss_cuts = [r["threshold"] for r in reference.best_thresholds(rows)]
-    # Tied optima are equally valid choices, so any relation one pair of them shows is correct.
-    attainable = {_relation(j, loss) for j in j_cuts for loss in loss_cuts}
-    if answer in attainable:
-        return False, None
-    expected = " or ".join(sorted(attainable))
-    ratio = (len(development) - n_pos) / n_pos
-    benefit = reference.DEFAULT_COSTS["FN"] - reference.DEFAULT_COSTS["TP"]
-    return False, (f"On your development recordings J's cutoff is {expected} than the "
-                   f"minimum-loss cutoff. J prices a miss at n_neg/n_pos = {ratio:.1f} false "
-                   f"referrals against {benefit:g} in the matrix; your scores' calibration decides "
-                   "where each cutoff falls.")
+    keys = {"stated", "optimum", "costs", "p_t"}
+    if not isinstance(frozen, dict) or not keys <= set(frozen):
+        return False, ("Set frozen to a dictionary with the keys 'stated', 'optimum', 'costs' and "
+                       "'p_t'.")
+    if development is None or len(development) == 0:
+        return UNAVAILABLE, NO_DEVELOPMENT + " A policy is frozen on development recordings."
+    costs = frozen["costs"]
+    if not (isinstance(costs, dict) and set(costs) == {"TP", "FP", "FN", "TN"}
+            and all(_is_number(v) and math.isfinite(v) for v in costs.values())):
+        return False, "Set costs to the four finite prices, for example dict(costs)."
+    try:
+        implied = reference.threshold_probability(costs)
+    except ValueError:
+        return False, ("These prices imply no threshold probability. Choose prices with "
+                       "C_FP > C_TN and C_FN > C_TP.")
+    p_t = frozen["p_t"]
+    if not (_is_number(p_t) and math.isfinite(p_t) and 0 < p_t < 1
+            and math.isclose(p_t, implied, rel_tol=1e-6)):
+        return False, f"p_t should follow from the prices: {implied:.4f}."
+    for key in ("stated", "optimum"):
+        if not _is_number(frozen[key]) or not (0 <= frozen[key] <= 1 or math.isinf(frozen[key])):
+            return False, f"Set {key} to one cutoff: a number between 0 and 1, or infinity."
+    if not math.isclose(frozen["stated"], implied, rel_tol=1e-6):
+        return False, (f"stated is the threshold the prices imply, {implied:.4f}; the development "
+                       "optimum goes in optimum.")
+    y = development["af"].to_numpy(dtype=bool)
+    scores = development["score"].to_numpy(dtype=float)
+    best = reference.cheapest(reference.operating_points(y, scores, costs))
+    attained = reference.policy_cost(y, scores >= frozen["optimum"], costs)
+    if not math.isclose(attained, best["loss"], rel_tol=1e-12, abs_tol=1e-12):
+        return False, ("optimum should be the development minimum-loss cutoff, best['threshold'] "
+                       "(or any cutoff that makes the same decisions).")
+    return False, None
 
 
 def _is_number(value):
-    """A real number, Python or NumPy (np.float32(.5), np.int64(2)), but not a boolean."""
-    return isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, (bool, np.bool_))
+    """A real number, Python or NumPy, but not a boolean."""
+    return isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(
+        value, (bool, np.bool_))
 
 
-def _own_freeze(answer, development, evaluation):
-    threshold, predicted = answer
-    if threshold is Ellipsis or predicted is Ellipsis:
+JOIN_SCORES = pd.DataFrame({
+    "recording": ["A00001", "A00004", "A00002", "Z99999", "A00002", "A00006", "A00007", "A00003",
+                  "A00005", "A00008"],
+    "score": [.2, .9, .5, .4, .6, .3, .7, 1.4, np.nan, .1]})
+JOIN_LABELS = pd.DataFrame({
+    "recording": ["A00001", "A00002", "A00003", "A00004", "A00005", "A00006", "A00007", "A00008"],
+    "reference_label": ["N", "N", "A", "A", "O", "~", "O", "N"]})
+
+
+CUSTOM = {"cal_report": _cal_report, "cal_platt": _cal_platt, "cal_isotonic": _cal_isotonic,
+          "cal_leak": _cal_leak, "cmp_bootstrap": _cmp_bootstrap, "cmp_changed": _cmp_changed,
+          "cmp_preference": _cmp_preference, "weight_fit": _weight_fit,
+          "weight_report": _weight_report, "weight_tuned": _weight_tuned,
+          "own_join": _own_join, "own_freeze": _own_freeze}
+
+
+# --- Table-driven cases for functions with small inputs ----------------------------
+
+
+# Two false positives and one miss, so a swap of FP and FN changes the answer.
+TABLE_DECISIONS = {"any": np.array([True, True, False, True, True]),
+                   "none": np.zeros(5, dtype=bool)}
+TABLE_AF = np.array([True, True, True, False, False])
+TABLE_KIND = np.array(["sustained", "paroxysmal", "paroxysmal", "artefact", "no_af"])
+
+
+def _swapped_rule_table():
+    table = windows.rule_table(TABLE_DECISIONS, TABLE_AF, TABLE_KIND, COSTS, 1000)
+    from sklearn.metrics import confusion_matrix
+    for name, review in TABLE_DECISIONS.items():
+        tn, fp, fn, tp = confusion_matrix(review, TABLE_AF, labels=[False, True]).ravel()
+        table.loc[name, "af_missed"] = 1000 * fn / len(TABLE_AF)
+        table.loc[name, "reviews"] = 1000 * (tp + fp) / len(TABLE_AF)
+        table.loc[name, "af_detected"] = 1000 * tp / len(TABLE_AF)
+        table.loc[name, "loss"] = (tp * COSTS["TP"] + fp * COSTS["FP"] + fn * COSTS["FN"]
+                                   + tn * COSTS["TN"])
+    return table
+
+
+UNREADABLE = {"over_read_success": .5, "repeat_readable": .6, "repeat_cost": .2, "delay_cost": .1,
+              "refer_cost": 3.0, "sensitivity": .76, "specificity": .95}
+
+
+def _any_rule(positive):
+    return np.asarray(positive, dtype=bool).any(axis=1)
+
+
+def _af_denominator_nri(old, new, y, cut):
+    before, after = old >= cut, new >= cut
+    up, down, n_af = after & ~before, before & ~after, y.sum()
+    event = (up & y).sum() / n_af - (down & y).sum() / n_af
+    non_event = (down & ~y).sum() / n_af - (up & ~y).sum() / n_af
+    return {"event": event, "non_event": non_event, "total": event + non_event}
+
+
+def _whole_cohort_nri(old, new, y, cut):
+    before, after = old >= cut, new >= cut
+    up, down, n = after & ~before, before & ~after, len(y)
+    event = (up & y).sum() / n - (down & y).sum() / n
+    non_event = (down & ~y).sum() / n - (up & ~y).sum() / n
+    return {"event": event, "non_event": non_event, "total": event + non_event}
+
+
+def _strict_nri(old, new, y, cut):
+    return comparison.categorical_nri(old - 1e-12, new - 1e-12, y, cut)
+
+
+def _queue_capacity(function):
+    """The cheapest row within the overflow tolerance, returned with its overflow probability."""
+    from scipy import stats
+    if not callable(function):
+        return False, "Expected your capacity_policy function."
+    rows = pd.DataFrame({"threshold": [.1, .3, .5, .8], "reviews": [70., 49., 35., 10.],
+                         "loss": [80., 90., 110., 170.]})
+    got, error = _call(function, rows, 50, .1)
+    if error is not None:
+        return False, f"It raised {type(error).__name__}: {error}."
+    if _unfinished(got):
         return True, WAITING
-    if not development:
-        return UNAVAILABLE, NO_DEVELOPMENT + " A policy is frozen on development recordings."
-    if not _is_number(threshold) or not 0 <= threshold <= 1.01:
-        return False, "Set final_threshold to a cutoff between 0 and 1.01, chosen on development."
-    if not _is_number(predicted) or not math.isfinite(predicted) or predicted < 0:
-        return False, "Set predicted_evaluation_loss to one number: the total loss you expect."
-    threshold, predicted = float(threshold), float(predicted)
-    dev = reference.policy_summary(development, threshold, reference.DEFAULT_COSTS)
-    # Only a positive total can be copied unscaled: a development total of zero scales to zero.
-    if (dev["total_loss"] > 0 and math.isclose(predicted, dev["total_loss"])
-            and len(evaluation) != len(development)):
-        return False, (f"That is the development total over {len(development):,} recordings; "
-                       f"evaluation has {len(evaluation):,}. Scale it before predicting.")
+    if not isinstance(got, pd.Series) or not {"threshold", "reviews", "loss"} <= set(got.index):
+        return False, "Return the chosen row of the table (a pandas Series), not only its cutoff."
+    if math.isclose(float(got["threshold"]), .3):
+        return False, ("Mean reviews within capacity is not daily service: a mean of 49 against "
+                       "a capacity of 50 overflows on about 45% of days. Filter on "
+                       "poisson.sf(capacity, reviews) <= tolerance.")
+    if math.isclose(float(got["threshold"]), .1):
+        return False, "Filter by the overflow tolerance before choosing the cheapest row."
+    if not math.isclose(float(got["threshold"]), .5):
+        return False, ("Add overflow = poisson.sf(capacity, reviews), keep the rows within the "
+                       "tolerance and return the cheapest.")
+    boundary = pd.DataFrame({"threshold": [.2, .4, .6], "reviews": [45.0, 41.3, 35.0],
+                             "loss": [80., 90., 110.]})
+    chosen, error = _call(function, boundary, 50, .1)
+    if error is None and isinstance(chosen, pd.Series) and "threshold" in chosen.index \
+            and math.isclose(float(chosen["threshold"]), .6):
+        return False, ("Overflow means more than capacity, P(X > c) = poisson.sf(capacity, "
+                       "mean). poisson.sf(capacity - 1, mean) is P(X >= c), which counts a "
+                       "day exactly at capacity as overflow and rejects a feasible policy.")
+    if not (error is None and isinstance(chosen, pd.Series) and "threshold" in chosen.index
+            and math.isclose(float(chosen["threshold"]), .4)):
+        return False, "Keep the cheapest row whose overflow probability is at most the tolerance."
+    if "overflow" not in got.index:
+        return False, ("The chosen row has no 'overflow' value. Add the column with "
+                       "poisson.sf(capacity, reviews) before filtering, so the row carries it.")
+    if not math.isclose(float(got["overflow"]), stats.poisson.sf(50, float(got["reviews"])),
+                        rel_tol=1e-6, abs_tol=1e-12):
+        return False, "The row's overflow should be poisson.sf(capacity, reviews) for that row."
     return False, None
 
 
-CUSTOM = {"own_join": _own_join, "own_j": _own_j, "own_freeze": _own_freeze}
+def _bad_project(points, prevalence, costs, per=1000):
+    """Applies the false-positive rate to every recording, not only those without AF."""
+    table = deployment.project(points, prevalence, costs, per)
+    table["FP"] = per * (1 - points["specificity"])
+    table["reviews"] = table["TP"] + table["FP"]
+    return table
+
+
+@lru_cache(maxsize=1)
+def cases():
+    """Small test inputs; full-cohort outputs are checked by the scenario tests."""
+    fx = _fixtures()
+    old, new, y = fx["old"], fx["new"], fx["y"]
+    toy_points = pd.DataFrame({"threshold": [np.inf, .8, .5, .2], "sensitivity": [0, .5, .8, 1.],
+                               "specificity": [1., .95, .9, .6]})
+    positive, valid = fx["window_positive"], fx["window_valid"]
+    calls_af = np.array([True, True, True, False])
+    return {
+        # Extension 1
+        "cal_shift": [_case((np.array([.1, .4]), .1, .02),
+                            calibration.shift_prior(np.array([.1, .4]), .1, .02),
+                            "Add logit(new) - logit(old) to logit(p), then apply the sigmoid.",
+                            diagnose=[(np.array([.1, .4]) * .02 / .1,
+                                       "Multiplying probabilities by the prevalence ratio is not "
+                                       "Bayes' rule; shift the log-odds instead."),
+                                      (calibration.shift_prior(np.array([.1, .4]), .02, .1),
+                                       "The shift runs the wrong way: add logit(new) and subtract "
+                                       "logit(old).")])],
+        # Extension 2
+        "cmp_nri": [
+            _case((old, new, y, .2), comparison.categorical_nri(old, new, y, .2),
+                  "Each NRI component is a proportion within its own outcome group, and a score "
+                  "equal to the cut is reviewed.",
+                  diagnose=[(_af_denominator_nri(old, new, y, .2),
+                             "Each component divides by its own outcome group: the recordings "
+                             "without AF for the non-event component, not the AF recordings."),
+                            (_whole_cohort_nri(old, new, y, .2),
+                             "Divide each component by its own outcome group, not the whole "
+                             "cohort."),
+                            (_strict_nri(old, new, y, .2),
+                             "A score equal to the cut is reviewed: use >=, not >.")])],
+        # Extension 4
+        "queue_project": [
+            _case((toy_points, .05, COSTS, 1000), deployment.project(toy_points, .05, COSTS, 1000),
+                  "Apply the sensitivity to the AF group (per × prevalence) and the false-positive "
+                  "rate to the rest; keep fractional counts and price all four.",
+                  diagnose=[(_bad_project(toy_points, .05, COSTS, 1000),
+                             "The false-positive rate applies only to the recordings without AF, "
+                             "per × (1 - prevalence), not to every recording.")])],
+        # Extension 5
+        "window_rules": [_case((positive, valid, 2), windows.aggregate(positive, valid, 2),
+                               "Reduce over each recording's windows: any, more than half of its "
+                               "own windows, and at least k positive.",
+                               diagnose=[({**windows.aggregate(positive, valid, 2),
+                                           "majority": positive.sum(axis=1) >= valid.sum(axis=1) / 2},
+                                          "Majority means strictly more than half."),
+                                         ({**windows.aggregate(positive, valid, 2),
+                                           "majority": positive.sum(axis=1) > positive.shape[1] / 2},
+                                          "Count only the recording's own windows: recordings "
+                                          "differ in length, so use valid.sum(axis=1).")])],
+        "window_persistence": [
+            _case((positive, 2), windows.persistent(positive, 2),
+                  "A run is consecutive positive windows: sliding_window_view(positive, k, axis=1)"
+                  ".all(axis=-1).any(axis=1).",
+                  diagnose=[(positive.sum(axis=1) >= 2,
+                             "That counts positive windows anywhere; separated spikes are not a "
+                             "run.")])],
+        "window_sensitivity": [
+            _case((positive, calls_af, _any_rule),
+                  windows.recording_sensitivity(positive, calls_af, _any_rule),
+                  "Apply the rule to get one decision per recording, then recall_score against "
+                  "the recording labels.",
+                  diagnose=[(positive[calls_af].sum() / calls_af.sum(),
+                             "That counts positive windows, not recordings. Apply the rule first.")])],
+        "weight_correct": [
+            _case((np.array([.5, .9]), 9.), features.undo_weighting(np.array([.5, .9]), 9.),
+                  "Subtract log(w) on the log-odds scale, then apply the sigmoid.",
+                  diagnose=[(np.array([.5, .9]) / 9., "Dividing a probability by the weight is not "
+                                                      "the inverse of weighting the odds."),
+                            (features.undo_weighting(np.array([.5, .9]), 1 / 9.),
+                             "The correction runs the wrong way: subtract log(w), do not add it.")])],
+        "window_unreadable": [
+            _case((.3, COSTS, UNREADABLE), deployment.unreadable_losses(.3, COSTS, UNREADABLE),
+                  "Price all four pathways. The repeat pays its costs once, then weights the "
+                  "readable branch by repeat_readable and the over-read fallback by the rest; an "
+                  "unresolved over-read leaves AF undetected after using a review.",
+                  diagnose=[({**deployment.unreadable_losses(.3, COSTS, UNREADABLE),
+                              "over_read": .3 * COSTS["TP"] + .7 * COSTS["FP"]},
+                             "An over-read is not an ordinary review: it is conclusive only with "
+                             "probability over_read_success, and an unresolved AF recording is "
+                             "still undetected.")])],
+    }
 
 
 def names():
     """Every checker name a notebook may pass to ``run``."""
-    return set(cases()) | set(CUSTOM)
+    return set(cases()) | set(CUSTOM) | {"queue_prevalence"}
 
 
-# --- One entry point -----------------------------------------------------------
+def _queue_prevalence(answer):
+    if answer is Ellipsis:
+        return True, WAITING
+    fx = _fixtures()
+    d = fx["development"]
+    points = reference.operating_points(d["af"], d["random_forest"], COSTS)
+    chosen = deployment.capacity_policy(deployment.project(points, .05, COSTS), 50, .1)
+    grid = [k / 200 for k in range(2, 21)]
+    expected = deployment.highest_safe_prevalence(points, chosen["threshold"], COSTS, 50, .1, grid)
+    if _is_number(answer) and math.isclose(answer, expected):
+        return False, None
+    if _is_number(answer) and math.isclose(answer, 100 * expected):
+        return False, "Store the prevalence as a proportion, not a percentage."
+    if _is_number(answer) and math.isclose(answer, expected + .005):
+        return False, "That is the first prevalence that breaks the tolerance; report the last safe one."
+    return False, ("Hold the cutoff fixed, project it at each prevalence on the grid, and keep the "
+                   "highest prevalence whose overflow probability is at most the tolerance.")
+
+
+CUSTOM["queue_prevalence"] = _queue_prevalence
+CUSTOM["queue_capacity"] = _queue_capacity
+
+
+def _window_table(function):
+    """One row per rule, labelled by the rule's name, compared rule by rule."""
+    if not callable(function):
+        return False, "Expected your rule_table function."
+    got, error = _call(function, TABLE_DECISIONS, TABLE_AF, TABLE_KIND, COSTS, 1000)
+    if error is not None:
+        return False, f"It raised {type(error).__name__}: {error}."
+    if _unfinished(got):
+        return True, WAITING
+    expected = windows.rule_table(TABLE_DECISIONS, TABLE_AF, TABLE_KIND, COSTS, 1000)
+    problem = _table_problem(got, list(expected.columns))
+    if problem:
+        return False, problem
+    labels = list(got.index)
+    if len(set(labels)) != len(labels) or set(labels) != set(expected.index):
+        return False, ("Index the table by rule name, one row per rule in decisions "
+                       f"({', '.join(map(repr, expected.index))}).")
+    got = got.loc[list(expected.index)]
+    if _equal(got[list(expected.columns)], expected):
+        return False, None
+    if _equal(got[list(expected.columns)], _swapped_rule_table()):
+        return False, ("FP and FN are swapped: pass the reference labels first, "
+                       "confusion_matrix(af_present, review, ...).")
+    return False, ("One row per rule, counts per 1,000 recordings from confusion_matrix, and the "
+                   "loss over all four outcomes.")
+
+
+CUSTOM["window_table"] = _window_table
+
+
+# --- One entry point ----------------------------------------------------------------
 
 
 def _verdict(name, answer, context):
     """(waiting, problem) for one answer; (False, None) means correct."""
-    if callable(answer) and _placeholder_in_source(answer):
+    if callable(answer) and not hasattr(answer, "predict") and _placeholder_in_source(answer):
         return True, WAITING
     if name in CUSTOM:
         return CUSTOM[name](answer, *context)
     for case in cases()[name]:
-        try:
-            actual = answer(*case["args"]) if callable(answer) else answer
-        except Exception as error:
-            return False, f"{case['hint']} ({type(error).__name__}: {error})"
+        if callable(answer):
+            actual, error = _call(answer, *case["args"])
+            if error is not None:
+                return False, f"{case['hint']} ({type(error).__name__}: {error})"
+        else:
+            actual = answer
         if _unfinished(actual):
             return True, WAITING
-        shape = _shape_problem(actual, case["expected"])
+        expected = case["expected"]
+        if isinstance(expected, pd.DataFrame):
+            shape = _table_problem(actual, list(expected.columns))
+        else:
+            shape = _shape_problem(actual, expected)
         if shape and not any(_equal(actual, valid, case["rtol"]) for valid in case["accept"]):
             return False, shape
-        if any(_equal(actual, valid, case["rtol"]) for valid in (case["expected"], *case["accept"])):
+        if any(_equal(actual, valid, case["rtol"]) for valid in (expected, *case["accept"])):
             continue
         hint = next((h for wrong, h in case["diagnose"] if _equal(actual, wrong, case["rtol"])),
                     case["hint"])
@@ -694,7 +995,7 @@ def _verdict(name, answer, context):
 
 
 def run(name, answer, *context):
-    """Check one prediction or learner function; return success for guarded follow-up cells.
+    """Check one learner answer; return success for guarded follow-up cells.
 
     ``context`` passes the learner's own data to the Extension 6 checks.
     """
@@ -702,14 +1003,13 @@ def run(name, answer, *context):
         unattempted, problem = _verdict(name, answer, context)
     except Exception as error:
         unattempted, problem = False, (f"The checker could not read this answer "
-                                   f"({type(error).__name__}: {error}).")
+                                       f"({type(error).__name__}: {error}).")
     if unattempted == UNAVAILABLE:
         print(f"Not available: {name}. {problem}")
         return False
     if problem is None:
-        where = "on your own recordings" if name in ("own_j", "own_freeze") else \
-            "including a small counterexample"
-        print(f"✓ {name}: checked, {where}.")
+        where = "on your own recordings" if name == "own_freeze" else "on the checker's cases"
+        print(f"✓ {name}: checked {where}.")
         return True
     print(f"{'Not attempted yet' if unattempted else 'Not yet'}: {name}. {problem}")
     if os.environ.get("UTILITY_STRICT") == "1":
@@ -717,82 +1017,49 @@ def run(name, answer, *context):
     return False
 
 
-# --- Waiting for a learner function, and the stuck switches ---------------------
+# --- Waiting for a learner answer, and the stuck switches ---------------------------
 
 
-def _expected_counts(se, sp, prevalence, population=1000):
-    af, non_af = population * prevalence, population * (1 - prevalence)
-    return {"TP": af * se, "FN": af * (1 - se), "FP": non_af * (1 - sp), "TN": non_af * sp}
+def _fit_models_reference(train, features_=features.FEATURES):
+    return features.fit_models(train, features_)
 
 
-def _select_mean_feasible(rows, capacity):
-    return min((row for row in rows if row["reviews"] <= capacity), key=lambda row: row["loss"])["threshold"]
-
-
-def _minimum_loss(scores, y, costs):
-    cuts = np.r_[0., np.unique(scores), 1.01]
-    return float(min(reference.matrix_loss(comparison.counts_at_threshold(scores, y, cut), costs)
-                     for cut in cuts))
-
-
-def _fit_weighted(features, y, row_weights):
-    model = logistic.fit_logistic_regression(features, y, row_weights=row_weights)
-    return np.r_[model["intercept"], model["coefficients"]]
-
-
-def _recording_counts(review, af_present):
-    review, af = np.asarray(review, dtype=bool), np.asarray(af_present, dtype=bool)
-    return {"TP": int(np.sum(review & af)), "FP": int(np.sum(review & ~af)),
-            "FN": int(np.sum(~review & af)), "TN": int(np.sum(~review & ~af))}
-
-
-# Learner functions that later cells use: (checker, problem, reference version or None).
-# A Fix-the-bug function has no switch: the repair is the exercise.
+# Learner answers that later cells use: (checker, problem, reference or None).
+# A Fix-the-bug function has no switch: the repair is the exercise. A fitted model's
+# reference is a function of no arguments that fits it.
 FUNCTIONS = {
-    "probability_summary": ("cal_summary", "Problem A", calibration.reliability_summary),
-    "fit_platt": ("cal_fit", "Problem C", calibration.platt_fit),
-    "shift_prior": ("cal_shift", "Problem E", calibration.recalibrate_in_the_large),
-    "categorical_nri": ("cmp_categorical", "Problem B",
-                        lambda old, new, y, cut: comparison.categorical_nri(old, new, y, [cut])),
-    "movement_indices": ("cmp_continuous", "Problem C",
-                         lambda old, new, y: {"continuous": comparison.continuous_nri(old, new, y),
-                                              "idi": comparison.idi(old, new, y)}),
-    "paired_bootstrap": ("cmp_bootstrap", "Problem D", comparison.delta_net_benefit_bootstrap),
-    "changed_recordings": ("cmp_changed", "Problem E",
-                           lambda ids, old, new, y, preference: _changed(
-                               ids, old, new, np.asarray(y, dtype=bool), preference)),
-    "balanced_weights": ("weight_weights", "Problem B",
-                         lambda y: logistic.class_weights(y, "balanced")),
-    "fit_weighted": ("weight_fit", "Problem C", _fit_weighted),
-    "minimum_loss": ("weight_optimum", "Problem D", _minimum_loss),
-    "undo_weighting": ("weight_correct", "Problem E", None),
-    "expected_counts": ("queue_counts", "Problem B", _expected_counts),
-    "select_mean_feasible": ("queue_select", "Problem C", _select_mean_feasible),
-    "fraction_over_capacity": ("queue_simulate", "Problem D",
-                               lambda arrival_mean, review_rate, capacity, days=365, seed=20261106:
-                               _queue(arrival_mean, review_rate, capacity, days, seed)),
-    "select_policy": ("queue_tolerance", "Problem E", None),
-    "aggregate": ("window_rules", "Problem B",
-                  lambda positive, k: {"any": windows.any_positive(positive),
-                                       "majority": windows.majority(positive),
-                                       "count": windows.count_at_least(k)(positive)}),
-    "persistent": ("window_persistence", "Problem C",
-                   lambda positive, run_length: windows.persistence(run_length)(positive)),
-    "recording_counts": ("window_counts", "Problem D", _recording_counts),
-    "recording_sensitivity": ("window_sensitivity", "Problem E", None),
-    "repeat_losses": ("window_repeat", "Problem F",
-                      lambda p, costs, repeat_cost, q, se, sp, delay_cost=0.: _repeat(
-                          p, costs, repeat_cost, q, se, sp, delay_cost)),
+    "calibration_report": ("cal_report", "Problem A", calibration.calibration_report),
+    "platt_map": ("cal_platt", "Problem B", _platt_reference),
+    "isotonic_map": ("cal_isotonic", "Problem C", _isotonic_reference),
+    "compare_recalibrations": ("cal_leak", "Problem D", None),
+    "shift_prior": ("cal_shift", "Problem E", calibration.shift_prior),
+    "categorical_nri": ("cmp_nri", "Problem A", comparison.categorical_nri),
+    "delta_net_benefit": ("cmp_bootstrap", "Problem B", comparison.delta_net_benefit),
+    "changed_decisions": ("cmp_changed", "Problem C", comparison.changed_decisions),
+    "compare_net_benefit": ("cmp_preference", "Problem D", None),
+    "fit_models": ("weight_fit", "Problem A", _fit_models_reference),
+    "test_report": ("weight_report", "Problem B", None),
+    "tuned": ("weight_tuned", "Problem C",
+              lambda: features.tuned_threshold(_fixtures()["rhythm"]["train"], COSTS)),
+    "undo_weighting": ("weight_correct", "Problem D", features.undo_weighting),
+    "project": ("queue_project", "Problem A", deployment.project),
+    "capacity_policy": ("queue_capacity", "Problem B", deployment.capacity_policy),
+    "aggregate": ("window_rules", "Problem A", windows.aggregate),
+    "persistent": ("window_persistence", "Problem B", windows.persistent),
+    "rule_table": ("window_table", "Problem C", windows.rule_table),
+    "recording_sensitivity": ("window_sensitivity", "Problem D", None),
+    "unreadable_losses": ("window_unreadable", "Problem E", deployment.unreadable_losses),
     "join_scores": ("own_join", "Problem A", own_scores.join_scores),
 }
+FITTED = {"platt_map", "isotonic_map", "tuned"}
 
 
 def ready(**answers):
-    """True when every named learner function passes its checker; one line per wait otherwise.
+    """True when every named learner answer passes its checker; one line per wait otherwise.
 
-    ``check.ready(probability_summary=probability_summary)`` lets a later cell
-    wait for an unfinished function, saying which problem it needs and how to
-    unblock it. Nothing is printed when all pass.
+    ``check.ready(platt_map=platt_map)`` lets a later cell wait for an
+    unfinished answer, saying which problem it needs and how to unblock it.
+    Nothing is printed when all pass.
     """
     pending = []
     for name, answer in answers.items():
@@ -814,7 +1081,7 @@ def ready(**answers):
 
 
 def use_reference(name):
-    """The stuck switch: return the reference version of a function later cells use, and say so."""
+    """The stuck switch: return the reference version of an answer later cells use, and say so."""
     function = FUNCTIONS.get(name, (None, None, None))[2]
     if function is None:
         print(f"There is no reference version of {name!r}. Use the worked copy in "
@@ -822,4 +1089,4 @@ def use_reference(name):
         return None
     print(f"Using the reference {name} from now on. Come back to your own version later and "
           "compare it with the worked copy.")
-    return function
+    return function() if name in FITTED else function

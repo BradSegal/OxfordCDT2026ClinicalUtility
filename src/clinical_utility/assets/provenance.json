@@ -108,10 +108,19 @@
     "resnet": "Raw simulated waveform-model score. AF evidence is centred at 3.2, and a 40% mixture component of O recordings draws AF-like evidence centred at 3.0. These are mixture weights, not rates at any cutoff. Deliberately too high and too extreme (overconfident).",
     "resnet_calibrated": "Platt recalibration of the raw resnet score, fitted on calibration records only; same ranking as resnet."
   },
+  "six_recordings": [
+    "A02183",
+    "A01929",
+    "A08248",
+    "A00822",
+    "A03391",
+    "A03884"
+  ],
+  "six_recordings_rule": "Development recordings; for each of AF with a high, middle and low forest score and non-AF (O, N, N) with the same bands (above 0.5, 0.26 to 0.5, below 0.2), the recording whose forest score is nearest 0.85, 0.35 and 0.05 (AF) or 0.70, 0.30 and 0.02 (non-AF).",
   "calibration": {
-    "method": "Platt scaling: sigmoid(intercept + slope * logit(resnet))",
-    "intercept": -1.9850685570344673,
-    "slope": 0.6568150601375636,
+    "method": "Platt scaling: sigmoid(intercept + slope * logit(resnet)), scikit-learn LogisticRegression(C=inf, solver='newton-cholesky')",
+    "intercept": -1.985068557034457,
+    "slope": 0.6568150601375592,
     "fit_split": "calibration",
     "ranking_preserved": true
   },

@@ -23,11 +23,13 @@ from stated Gaussian mixtures for a decision-theory exercise; `provenance.json`
 records the mixtures, seed and recalibration parameters. They are not outputs
 of trained classifiers, evidence of the performance of named architectures, or
 calibrated probabilities by assertion. `resnet` is deliberately overconfident;
-`resnet_calibrated` is its Platt recalibration, fitted on the separate
-calibration partition only.
+`resnet_calibrated` is its Platt recalibration (an unpenalised scikit-learn
+logistic regression on logit(score)), fitted on the separate calibration
+partition only.
 
-`teaching_cases.json` contains six entirely invented examples. Their IDs do not
-identify actual patients. See `provenance.json` for generation and partition details.
+The six hand-checkable recordings used in the core notebook are real
+development recordings chosen by the rule recorded in `provenance.json`, which
+also gives the generation and partition details.
 
 The window-level recordings (`clinical_utility.windows`) and the two rhythm
 features used for the class-weighting demonstration

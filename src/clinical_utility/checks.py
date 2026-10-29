@@ -1,32 +1,37 @@
-"""Specific, non-blocking feedback for the learner's calculations.
+"""Specific, non-blocking feedback for the learner's calculations in the core notebook.
 
 Every checker prints one verdict and returns a ``CheckResult`` that is truthy
 when the answer is right. ``✓`` means correct, ``Not yet`` names the likely
 mistake and ``Not attempted yet`` means the ``...`` placeholder is still there.
-Two predictions are hypotheses whose premises come later: their checkers only
-record a valid answer (``Recorded``), and a ``reconcile_`` function prints the
-result beside it once the reveal cell has run.
 A checker never raises in a student notebook. With ``UTILITY_STRICT=1`` (set
 when the worked notebooks are executed automatically) a failure raises
 ``AssertionError`` instead, so an incorrect worked answer cannot go unnoticed.
 
-Expected answers come from ``reference``; no price or count is restated here.
+Expected answers come from ``reference``; mistakes are recognised by running
+the common wrong versions of each calculation on the same inputs.
 """
 
 import contextlib
 import functools
-import io
 import inspect
+import io
 import math
 import numbers
 import os
+import warnings
 
-from . import data, reference
+import numpy as np
+import pandas as pd
+from scipy.special import logit
+from sklearn.exceptions import NotFittedError
+from sklearn.linear_model import LogisticRegression
+
+from . import calibration, data, reference
 
 MAX_PROBLEMS_SHOWN = 3
-OUTCOMES = (("TP", True, True), ("FP", False, True), ("FN", True, False), ("TN", False, False))
 # No two cells share a price and none equals its default, so each mistake is identifiable.
 UNUSUAL_COSTS = {"TP": 2.0, "FP": 3.0, "FN": 11.0, "TN": 0.5}
+DEFAULT_COSTS = reference.DEFAULT_COSTS
 
 
 class CheckResult:
@@ -86,7 +91,7 @@ def _is_number(value):
     return isinstance(value, numbers.Real) and not isinstance(value, bool)
 
 
-def _near(actual, expected, tolerance=1e-9):
+def _near(actual, expected, tolerance=1e-6):
     if not _is_number(actual) or not _is_number(expected):
         return False
     try:
@@ -113,509 +118,500 @@ def _value(name, actual, expected, hints=(), default_hint=""):
     return _report(name, [f"Received {actual!r}. {default_hint}".strip()])
 
 
-def _choice(name, answer, expected, hints, options=None):
-    """A Predict answered with one of a few words; ``hints`` maps each wrong option to its hint."""
-    options = tuple(options or (expected, *hints))
-    if answer is Ellipsis:
-        return _waiting(name)
-    if not isinstance(answer, str) or answer.strip().lower() not in options:
-        listed = ", ".join(repr(o) for o in options)
-        return _report(name, [f"Answer with one of {listed}, as a string in quotes."])
-    answer = answer.strip().lower()
-    if answer == expected:
-        return _report(name, [])
-    return _report(name, [hints[answer]])
+# --- Shared inputs and helpers ------------------------------------------------
 
 
-# --- Section 1 ---------------------------------------------------------------
-
-PREDICT_MISS_PRICE = 10.0
-
-
-def predicted_threshold(answer):
-    """Problem 1: the threshold probability p_t when C_FN = 10 and the other prices are unchanged."""
-    costs = {**reference.DEFAULT_COSTS, "FN": PREDICT_MISS_PRICE}
-    expected = reference.probability_threshold(costs)
-    original = reference.probability_threshold(reference.DEFAULT_COSTS)
-    return _value("Threshold when a miss costs more", answer, expected, hints=(
-        (original, "That is the threshold at the original prices. A dearer miss makes 'no "
-                   "review' more expensive at every probability, so the crossing point moves."),
-        (reference.probability_threshold({**costs, "TP": 0.0}),
-         "You set C_TP to 0. A review takes the same clinician time when it finds AF, so the "
-         "expected loss of review is 1 at every probability."),
-        (1 - expected, "That is the probability of no AF at the crossing point. Solve for p, "
-                       "the AF probability."),
-        (2 * original, "The threshold moved the wrong way. When a miss costs more, weaker "
-                       "evidence of AF is enough to justify a review."),
-        (100 * expected, "Give the threshold as a proportion between 0 and 1, not a percentage."),
-    ), default_hint="Set the expected loss of review equal to that of no review and solve for p.")
+def _scores():
+    return data.load_scores()
 
 
-# --- Section 2 ---------------------------------------------------------------
+def _split(name):
+    frame = _scores()
+    return frame[frame["split"] == name].reset_index(drop=True)
 
 
-def calls_at_half(reviews, misses):
-    """Problem 2: reviews and missed AF among the six cases at a cutoff of 0.5."""
-    name = "Calls at 0.5"
-    if reviews is Ellipsis or misses is Ellipsis:
-        return _waiting(name)
-    counts = reference.confusion_counts(
-        reference.evaluate_policy(data.teaching_cases(), .5, reference.DEFAULT_COSTS))
-    problems = []
-    if not _matches(reviews, counts["TP"] + counts["FP"]):
-        if _matches(reviews, counts["TP"]):
-            problems.append("You counted only the AF recordings that were reviewed. Teaching B "
-                            "has no AF but its score meets the cutoff, so it is reviewed too.")
-        else:
-            problems.append("Count every recording whose score is at or above 0.5, whatever its "
-                            "reference label.")
-    if not _matches(misses, counts["FN"]):
-        if _matches(misses, 0):
-            problems.append("Teaching E contains AF but scores below 0.5, so it is missed.")
-        elif _matches(misses, counts["FN"] + counts["TN"]):
-            problems.append("A miss is an AF recording that is not reviewed. Unreviewed "
-                            "recordings without AF are true negatives.")
-        else:
-            problems.append("Count the AF recordings whose score is below 0.5.")
-    return _report(name, problems)
+def _six():
+    return data.six_recordings()
 
 
-def npv_review_none(answer):
-    """Problem 3: NPV when no development recording is reviewed."""
-    name = "NPV when nobody is reviewed"
-    rows = data.load_records("random_forest", "development")
-    counts = reference.confusion_counts(reference.evaluate_policy(rows, 1.01, reference.DEFAULT_COSTS))
-    m = reference.metrics(counts)
-    if _is_number(answer) and answer != answer:
-        return _report(name, [
-            "PPV is undefined here because nobody is reviewed. NPV is defined: every recording "
-            "is unreviewed, so its denominator is the whole cohort."])
-    return _value(name, answer, m["npv"], hints=(
-        (counts["FN"] / counts["TN"],
-         "You divided misses by true negatives. NPV is TN/(TN + FN): the AF-negative fraction "
-         "of everyone not reviewed."),
-        (1 - m["npv"], "That is the fraction of unreviewed recordings that contain AF. NPV is "
-                       "the fraction that do not."),
-        (100 * m["npv"], "Give NPV as a proportion between 0 and 1, not a percentage."),
-        (m["specificity"], "That is specificity, TN/(TN + FP). NPV conditions on the decision: "
-                           "TN/(TN + FN)."),
-    ), default_hint="NPV = TN/(TN + FN), and every development recording is unreviewed.")
+def _unfinished(value):
+    """True for the starter's ``...``, or a structure that still holds one."""
+    if value is Ellipsis:
+        return True
+    if isinstance(value, dict):
+        return any(_unfinished(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_unfinished(v) for v in value)
+    return False
 
 
-# --- Sections 3 and 6: pricing all four cells -------------------------------
+def _call(function, *args):
+    """(result, error) of the learner's function, without letting it stop the notebook."""
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return function(*args), None
+    except Exception as error:  # the learner's code may raise anything
+        return None, error
 
 
-def _cell_hint(key, got, costs):
-    other = [k for k, v in costs.items() if k != key and _matches(got, v)]
-    partner = {"FP": "FN", "FN": "FP"}.get(key)
-    if not _is_number(got):
-        return "Return a number from the costs dictionary."
-    if key == "TP" and _matches(got, 0):
-        return "A correct positive still uses a review: return costs['TP'], not 0."
-    if key == "TN" and _matches(got, 0):
-        return f"Read the TN price from the matrix; it is not always zero (here {costs['TN']!r})."
-    if costs is not reference.DEFAULT_COSTS and _matches(got, reference.DEFAULT_COSTS[key]):
-        return (f"You returned the default {key} price. Read prices from the costs argument so "
-                "the function works for any matrix.")
-    if partner in other:
-        return "FP and FN are swapped. FP is a review without AF; FN is AF with no review."
-    if other:
-        return f"That is the {other[0]} price. Check which branch handles {key}."
-    return f"The {key} branch should return costs['{key}'] unchanged."
+def _same(actual, expected, tolerance=1e-9):
+    """Numbers, NaNs, dicts and sequences compared value by value."""
+    if isinstance(expected, dict):
+        return (isinstance(actual, dict) and set(expected) <= set(actual)
+                and all(_same(actual[k], expected[k], tolerance) for k in expected))
+    if isinstance(expected, float) and math.isnan(expected):
+        return _is_number(actual) and math.isnan(float(actual))
+    return _near(actual, expected, tolerance)
 
 
-def _price_cells(name, function, cost_sets):
-    if function is Ellipsis:
-        return _waiting(name)
-    if not callable(function):
-        return _not_function(name, function)
-    problems = []
-    for costs in cost_sets:
-        for key, actual, review in OUTCOMES:
-            try:
-                got = function(actual, review, dict(costs))
-            except Exception as error:
-                return _report(name, [f"Calling it raised {type(error).__name__}: {error}. Use "
-                                      "the keys 'TP', 'FP', 'FN' and 'TN' of costs."])
-            if got is Ellipsis:
-                return _waiting(name)
-            if not _matches(got, costs[key]):
-                problems.append(f"With costs {costs}, actual_af={actual} and review={review} "
-                                f"({key}) returned {got!r}; expected {costs[key]!r}. "
-                                + _cell_hint(key, got, costs))
-    return _report(name, problems)
-
-
-def decision_cost(function):
-    """Problem 4: all four cells, at the default and at unusual prices."""
-    return _price_cells("Decision-cost function", function,
-                        (reference.DEFAULT_COSTS, UNUSUAL_COSTS))
-
-
-# --- Section 4 ---------------------------------------------------------------
-
-
-def policy(function):
-    """Problem 5: an inspectable ledger: review when score >= cutoff, priced by decision_cost."""
-    name = "Policy ledger"
-    if function is Ellipsis:
-        return _waiting(name)
-    if not callable(function):
-        return _not_function(name, function)
-    records = data.teaching_cases()
-    for costs in (reference.DEFAULT_COSTS, UNUSUAL_COSTS):
-        # 0.25 is Teaching E's score, so a strict > comparison is caught.
-        for threshold in (.5, .25, .2, 1.01):
-            try:
-                ledger = function([dict(r) for r in records], threshold, dict(costs))
-            except Exception as error:
-                return _report(name, [f"{type(error).__name__}: {error}. Read record['score'] "
-                                      "and record['af_present'] from each dictionary."])
-            if ledger is Ellipsis:
-                return _waiting(name)
-            if ledger is None:
-                return _report(name, ["It returned None. Return the ledger after the loop."])
-            if not isinstance(ledger, list) or len(ledger) != len(records):
-                return _report(name, ["Return a list with one dictionary per recording. Check "
-                                      "that `return` is after the loop, not inside it."])
-            for row, answer in zip(ledger, reference.evaluate_policy(records, threshold, costs)):
-                if not isinstance(row, dict) or not {"recording", "review", "loss"} <= set(row):
-                    return _report(name, ["Each entry needs the keys 'recording', 'review' and "
-                                          "'loss'."])
-                where = f"{answer['recording']} at cutoff {threshold} with costs {costs}"
-                if row["recording"] != answer["recording"]:
-                    return _report(name, ["Keep the records in their original order."])
-                if not _matches(row["review"], answer["review"]):
-                    return _report(name, [f"{where}: review should be {answer['review']}. Review "
-                                          "when record['score'] >= threshold: a score exactly at "
-                                          "the cutoff is reviewed."])
-                if not _near(row["loss"], answer["loss"]):
-                    return _report(name, [f"{where}: loss should be {answer['loss']:g}. Pass "
-                                          "af_present, the review decision and the costs argument "
-                                          "to decision_cost."])
-    return _report(name, [])
-
-
-@functools.lru_cache(maxsize=1)
-def _development_sweep():
-    return reference.sweep_thresholds(data.load_records("random_forest", "development"),
-                                      reference.DEFAULT_COSTS)
-
-
-def _hypothesis(name, answer, options):
-    """Record a prediction without marking it; the result is revealed and compared later."""
-    if answer is Ellipsis:
-        return _waiting(name)
-    if not isinstance(answer, str) or answer.strip().lower() not in options:
-        listed = ", ".join(repr(o) for o in options)
-        return _report(name, [f"Answer with one of {listed}, as a string in quotes."])
-    print(f"Recorded: {name}, {answer.strip().lower()!r}. It is not marked. Run the next cell "
-          "and compare the result with it.")
-    return CheckResult(True)
-
-
-def _reconcile(answer, expected, result, reasons):
-    """Print the revealed result beside the learner's recorded prediction."""
-    given = answer.strip().lower() if isinstance(answer, str) else None
-    if given == expected:
-        print(f"Your prediction, {given!r}, matches the result: {result}")
-    elif given in reasons:
-        print(f"You predicted {given!r}; the result is {expected!r}: {result} {reasons[given]}")
-    else:
-        print(f"No prediction was recorded. The result: {result}")
-    return CheckResult(given == expected)
-
-
-J_OPTIONS = ("lower", "higher", "same")
-
-
-def _j_relation():
-    rows = _development_sweep()
-    j_row = reference.best_thresholds(rows, "youden_j", minimise=False)[0]
-    loss_row = reference.best_thresholds(rows)[0]
-    relation = ("lower" if j_row["threshold"] < loss_row["threshold"] else
-                "higher" if j_row["threshold"] > loss_row["threshold"] else "same")
-    return relation, j_row, loss_row
-
-
-def j_cutoff(answer):
-    """Problem 7: record a prediction of J's cutoff against the minimum-loss cutoff."""
-    return _hypothesis("Prediction of J's cutoff", answer, J_OPTIONS)
-
-
-def reconcile_j_cutoff(answer):
-    """After Problem 7's reveal: the result beside the recorded prediction, with the reason."""
-    expected, j_row, loss_row = _j_relation()
-    ratio = (j_row["FP"] + j_row["TN"]) / (j_row["TP"] + j_row["FN"])
-    benefit = reference.DEFAULT_COSTS["FN"] - reference.DEFAULT_COSTS["TP"]
-    result = (f"J's cutoff, {j_row['threshold']:.3f}, is {expected} than the minimum-loss cutoff, "
-              f"{loss_row['threshold']:.3f}.")
-    reason = (f"J prices one miss at n_neg/n_pos = {ratio:.1f} false referrals; the matrix prices "
-              f"it at C_FN − C_TP = {benefit:g}.")
-    return _reconcile(answer, expected, result, {
-        "higher": reason + " A dearer miss justifies reviewing on weaker evidence: a lower cutoff.",
-        "lower": reason + " Here that makes J's cutoff higher.",
-        "same": "The two objectives price a miss differently. " + reason,
-    })
-
-
-def _counts(tp, fp, fn, tn):
-    return {"TP": tp, "FP": fp, "FN": fn, "TN": tn}
-
-
-def youden_j(function):
-    """Problem 6: J = sensitivity + specificity − 1 from four counts."""
-    name = "Youden's J"
-    if function is Ellipsis:
-        return _waiting(name)
-    if not callable(function):
-        return _not_function(name, function)
-    # Ordered so the first case that fails also tells the misconceptions apart.
-    for case in (_counts(2, 1, 1, 2), _counts(260, 150, 81, 3220), _counts(3, 2, 0, 1),
-                 _counts(9, 1, 1, 89)):
-        m = reference.metrics(case)
-        se, sp = m["sensitivity"], m["specificity"]
-        try:
-            got = function(dict(case))
-        except Exception as error:
-            return _report(name, [f"Calling it raised {type(error).__name__}: {error}. Read "
-                                  "counts['TP'], counts['FP'], counts['FN'] and counts['TN']."])
-        if got is Ellipsis:
-            return _waiting(name)
-        if _matches(got, m["youden_j"]):
-            continue
-        wrong = (
-            (se + sp, "You added sensitivity and specificity but did not subtract 1."),
-            (se + m["ppv"] - 1, "You used PPV in place of specificity. Specificity is "
-                                "TN/(TN + FP): it conditions on the reference, not the decision."),
-            (m["ppv"] + m["npv"] - 1, "You used the predictive values. J uses sensitivity "
-                                      "TP/(TP + FN) and specificity TN/(TN + FP)."),
-            (se + (1 - sp) - 1, "You used the false-positive rate, FP/(FP + TN), in place of "
-                                "specificity, TN/(TN + FP)."),
-        )
-        hint = next((h for w, h in wrong if _matches(got, w)),
-                    "Sensitivity is TP/(TP + FN) and specificity is TN/(TN + FP).")
-        return _report(name, [f"For {case}, expected {m['youden_j']:.4f}, received {got!r}. {hint}"])
-    return _report(name, [])
-
-
-# --- Section 5 ---------------------------------------------------------------
-
-FLIP_PRICES = range(2, 31)
-
-
-@functools.lru_cache(maxsize=1)
-def first_flip_price():
-    """First whole C_FN (C_TP=1, C_FP=1, C_TN=0) at which the raw ResNet's minimum dev loss <= the forest's."""
-    rows = [reference.sweep_thresholds(data.load_records(model, "development"),
-                                       reference.DEFAULT_COSTS)
-            for model in ("random_forest", "resnet")]
-    for miss in FLIP_PRICES:
-        costs = {**reference.DEFAULT_COSTS, "FN": float(miss)}
-        forest, resnet = (min(reference.matrix_loss(row, costs) for row in r) for r in rows)
-        if resnet <= forest:
-            return miss
+def _missing_keys(name, actual, keys):
+    if not isinstance(actual, dict):
+        return _report(name, [f"Return a dictionary with the keys {', '.join(map(repr, keys))}; "
+                              f"received {type(actual).__name__}."])
+    missing = [k for k in keys if k not in actual]
+    if missing:
+        return _report(name, [f"The dictionary has no {', '.join(map(repr, missing))}."])
     return None
 
 
-def flip_price(answer):
-    """Problem 8: the price at which the preference flips from the forest to the ResNet."""
-    name = "Price at which the preference flips"
-    flip = first_flip_price()
-    if answer is None:
-        return _report(name, ["Your loop never set the answer. The flip is where the ResNet's "
-                              "minimum loss becomes at most the forest's."])
-    return _value(name, answer, flip, hints=(
-        (flip + 1, "At the price just below your answer the two minimum losses are exactly "
-                   "equal. Use <= so a tie counts as the point where the forest stops being "
-                   "preferred."),
-        (flip - 1, "At that price the forest is still strictly cheaper. Stop at the first price "
-                   "where the ResNet is no worse."),
-        (FLIP_PRICES[0], "Your loop stopped on its first price. Compare the ResNet with the "
-                         "forest and break only when the ResNet is no worse."),
-        (FLIP_PRICES[-1], "Your loop ran to the end without breaking. Check the direction of the "
-                          "comparison and where the break sits."),
-    ), default_hint="Loop over whole-number miss prices with C_TP=1, C_FP=1 and C_TN=0, and stop "
-                    "at the first price where the ResNet's minimum loss is at most the forest's.")
+def _first_match(actual, variants, compare=_same):
+    for wrong, hint in variants:
+        if compare(actual, wrong):
+            return hint
+    return None
 
 
-def flip_on_new_sample(answer):
-    """Problem 9: would the flip price move on another sample of the same size?"""
-    return _choice("Flip price on another sample", answer, "could_move", {
-        "same": "The development split has a few hundred AF recordings, and near the flip the two "
-                "minimum losses differ by only a few units. Another sample of the same size could "
-                "move the flip. The next cell shows how far."},
-        options=("same", "could_move"))
+# --- Section 1 ----------------------------------------------------------------
 
 
-# --- Section 6 ---------------------------------------------------------------
-
-
-def colleague_cutoff(answer):
-    """Problem 10: is the colleague's chosen cutoff lower, equal or higher than yours?"""
-    records = data.load_records("random_forest", "development")
-
-    def free_correct_decisions(actual_af, review, costs):
-        if actual_af and not review:
-            return costs["FN"]
-        if review and not actual_af:
-            return costs["FP"]
-        return 0
-
-    theirs = reference.best_thresholds(
-        reference.sweep_thresholds(records, reference.DEFAULT_COSTS, free_correct_decisions))[0]
-    yours = reference.best_thresholds(_development_sweep())[0]
-    expected = ("lower" if theirs["threshold"] < yours["threshold"] else
-                "higher" if theirs["threshold"] > yours["threshold"] else "equal")
-    reason = ("The colleague's scorer charges nothing for a correct review, so every review "
-              "looks cheaper than it is.")
-    return _choice("The colleague's cutoff", answer, expected, {
-        "higher": reason + " Cheaper reviews pull the cutoff down, not up.",
-        "equal": reason + " That changes the balance between reviewing and not reviewing, so the "
-                          "cheapest cutoff can move.",
-        "lower": reason + " Here the cutoff does not move down.",
-    } if expected != "lower" else {
-        "higher": reason + " Cheaper reviews pull the cutoff down, not up.",
-        "equal": reason + " That changes the balance between reviewing and not reviewing, so the "
-                          "cheapest cutoff can move.",
-    }, options=("lower", "equal", "higher"))
-
-
-def colleague_cost(function):
-    """Problem 11: the repaired scorer must price all four cells from any matrix."""
-    return _price_cells("Repaired colleague's scorer", function, (UNUSUAL_COSTS,))
-
-
-# --- Section 7 ---------------------------------------------------------------
-
-
-def net_benefit(function):
-    """Problem 12: NB = TP/n − FP/n · p_t/(1 − p_t)."""
-    name = "Net benefit"
-    if function is Ellipsis:
-        return _waiting(name)
+def threshold_probability(function):
+    """Problem 1: p_t = harm / (harm + benefit) from any price matrix, and a refusal when it does not apply."""
+    name = "threshold_probability"
     if not callable(function):
         return _not_function(name, function)
-    records = data.teaching_cases()
-    cases = []
-    for threshold in (.5, .2):
-        counts = reference.confusion_counts(
-            reference.evaluate_policy(records, threshold, reference.DEFAULT_COSTS))
-        cases += [(counts, p) for p in (.2, .1, .4)]
-    cases.append((_counts(260, 150, 81, 3220), .2))
-    for counts, p in cases:
-        expected = reference.net_benefit(counts, p)
-        n, tp, fp, fn = sum(counts.values()), counts["TP"], counts["FP"], counts["FN"]
-        try:
-            got = function(dict(counts), p)
-        except Exception as error:
-            return _report(name, [f"Calling it raised {type(error).__name__}: {error}. Read the "
-                                  "four counts and the threshold probability p_t."])
+    cases = [DEFAULT_COSTS, {**DEFAULT_COSTS, "FN": 10.0}, UNUSUAL_COSTS]
+    for costs in cases:
+        got, error = _call(function, costs)
+        if error is not None:
+            return _report(name, [f"It raised {type(error).__name__}: {error}."])
         if got is Ellipsis:
             return _waiting(name)
-        if _matches(got, expected):
+        expected = reference.threshold_probability(costs)
+        if _near(got, expected):
             continue
-        wrong = (
-            (tp - fp * p / (1 - p), "Divide by n, the number of recordings, so net benefit is "
-                                    "per recording."),
-            ((tp - fp * p) / n, "Weight false positives by the odds p_t/(1 − p_t), not by p_t itself."),
-            ((tp - fp * (1 - p) / p) / n, "The odds are inverted: use p_t/(1 − p_t)."),
-            ((tp - fn * p / (1 - p)) / n, "Net benefit charges false positives (unnecessary "
-                                          "reviews), not misses."),
-            ((tp - fp * p / (1 - p)) / (tp + fp), "Divide by every recording, n = TP + FP + FN + "
-                                                  "TN, not only those reviewed."),
-        )
-        hint = next((h for w, h in wrong if _matches(got, w)), "NB = TP/n − (FP/n) × p_t/(1 − p_t).")
-        return _report(name, [f"For {counts} at p_t={p}, expected {expected:.4f}, received {got!r}. "
-                              + hint])
+        harm, benefit = costs["FP"] - costs["TN"], costs["FN"] - costs["TP"]
+        hint = _first_match(got, [
+            (costs["FP"] / (costs["FP"] + costs["FN"]),
+             "Only the price differences matter: harm = C_FP - C_TN and benefit = C_FN - C_TP. "
+             "A correct review still costs a review, so subtract C_TP."),
+            (1 - expected, "That is the probability of no AF at the crossing point."),
+            (harm / benefit, "That is harm / benefit, the odds at the threshold. The threshold "
+                             "is harm / (harm + benefit)."),
+            (100 * expected, "Give the threshold as a proportion, not a percentage."),
+            (benefit / (harm + benefit), "Harm and benefit are the wrong way round: the "
+                                         "numerator is the harm of a needless review."),
+        ])
+        return _report(name, [f"With prices {costs} it returned {got!r}; expected "
+                              f"{expected:.4f}. " + (hint or "Read every price from costs.")])
+    _, error = _call(function, {"TP": 1.0, "FP": 0.0, "FN": 5.0, "TN": 0.0})
+    if not isinstance(error, ValueError):
+        return _report(name, ["When C_FP = C_TN a review costs nothing extra, so review is never "
+                              "worse and the threshold rule does not apply. Raise a ValueError "
+                              "when harm or benefit is not positive."])
     return _report(name, [])
 
 
-def _highest_net_benefit_model():
-    table = data.load_arrays("development")
-    from .comparison import policy_net_benefit
-    values = {model: policy_net_benefit(table[model], table["af_present"], .2)
-              for model in data.MODEL_NAMES}
-    return max(values, key=values.get)
+# --- Section 2 ----------------------------------------------------------------
+
+COUNT_KEYS = ("TP", "FP", "FN", "TN")
 
 
-def highest_net_benefit(answer):
-    """Problem 13: record a prediction of the model with the highest net benefit at p_t = 0.2."""
-    return _hypothesis("Prediction of the highest net benefit at p_t = 0.2", answer,
-                       tuple(data.MODEL_NAMES))
+def _count_cases():
+    six = _six()
+    one_class = (np.zeros(3, dtype=bool), np.zeros(3, dtype=bool))
+    return [(six["af"], six["random_forest"] >= .2), (six["af"], six["random_forest"] >= .5),
+            one_class]
 
 
-def reconcile_highest_net_benefit(answer):
-    """After Problem 13's reveal: the result beside the recorded prediction, with the reason."""
-    expected = _highest_net_benefit_model()
-    reasons = {
-        "resnet": "The raw ResNet's scores are too high, so a stated 0.2 sends far more "
-                  "recordings for review than its best cutoff would.",
-        "resnet_calibrated": "Recalibration puts the ResNet's 0.2 close to its best cutoff, but "
-                             "Section 5 found the forest's best policy cheaper at C_FN = 5, which "
-                             "is the matrix behind p_t = 0.2.",
-        "random_forest": "At this preference another model is higher; compare the three at the "
-                         "same p_t.",
-    }
-    result = f"{data.MODEL_NAMES[expected]} has the highest net benefit at p_t = 0.2."
-    return _reconcile(answer, expected, result, {k: v for k, v in reasons.items() if k != expected})
+def six_counts(function):
+    """Problem 2: TP, FP, FN and TN from confusion_matrix, in the right order and for one class too."""
+    name = "six_counts"
+    if not callable(function):
+        return _not_function(name, function)
+    for y, review in _count_cases():
+        got, error = _call(function, y, review)
+        expected = reference.counts(y, review)
+        if error is not None:
+            if len(set(np.asarray(y))) == 1:
+                return _report(name, [
+                    "With only one class present, confusion_matrix(y, review) is 1 × 1 and ravel() "
+                    "has one value to unpack. Pass labels=[False, True] so the matrix is always "
+                    "2 × 2."])
+            return _report(name, [f"It raised {type(error).__name__}: {error}."])
+        if _unfinished(got):
+            return _waiting(name)
+        problem = _missing_keys(name, got, COUNT_KEYS)
+        if problem is not None:
+            return problem
+        got = {k: got[k] for k in COUNT_KEYS}
+        if _same(got, expected):
+            continue
+        e = expected
+        hint = _first_match(got, [
+            ({"TP": e["TN"], "FP": e["FP"], "FN": e["FN"], "TN": e["TP"]},
+             "TP and TN are swapped. confusion_matrix puts the true labels in rows and the "
+             "decisions in columns, both in the order [False, True], so ravel() returns "
+             "tn, fp, fn, tp."),
+            ({"TP": e["TN"], "FP": e["FN"], "FN": e["FP"], "TN": e["TP"]},
+             "This reads the matrix as [[TP, FN], [FP, TN]], the textbook layout. scikit-learn's "
+             "ravel() returns tn, fp, fn, tp."),
+            ({"TP": e["TP"], "FP": e["FN"], "FN": e["FP"], "TN": e["TN"]},
+             "FP and FN are swapped: call confusion_matrix(y_true, decisions), with the reference "
+             "labels first."),
+        ])
+        return _report(name, [f"Expected {expected}, received {got}. " + (hint or "")])
+    return _report(name, [])
 
 
-# --- Section 8 ---------------------------------------------------------------
-
-REFLECTION_MIN_WORDS = 40
+# --- Section 3 ----------------------------------------------------------------
 
 
-def frozen_policy(model, threshold, costs, predicted_loss):
-    """Problem 14: a complete frozen policy and a predicted evaluation loss, before the reveal.
+def _cost_variants(y, review, costs):
+    c = reference.counts(y, review)
 
-    The checker cannot judge the choice or the prediction. It checks that the
-    policy is complete and catches two slips: predicting the unscaled
-    development total, and predicting a loss per recording.
+    def price(tp, fp, fn, tn, prices=costs):
+        return tp * prices["TP"] + fp * prices["FP"] + fn * prices["FN"] + tn * prices["TN"]
+    return [
+        (price(c["TN"], c["FP"], c["FN"], c["TP"]),
+         "TP and TN are swapped: confusion_matrix(...).ravel() returns tn, fp, fn, tp."),
+        (price(c["TN"], c["FN"], c["FP"], c["TP"]),
+         "This reads the matrix as [[TP, FN], [FP, TN]]. scikit-learn's ravel() returns "
+         "tn, fp, fn, tp."),
+        (price(c["TP"], c["FN"], c["FP"], c["TN"]),
+         "FP and FN are swapped: pass the reference labels first, confusion_matrix(y, review)."),
+        (price(0, c["FP"], c["FN"], 0),
+         "Every outcome has a price, including the two correct ones. A correct review still "
+         "costs a review."),
+        (price(c["TP"], c["FP"], c["FN"], c["TN"], DEFAULT_COSTS),
+         "The prices look typed in. Read each one from the costs argument."),
+    ]
+
+
+def policy_cost(function):
+    """Problem 3: the total loss of a set of decisions from confusion_matrix and all four prices."""
+    name = "policy_cost"
+    if not callable(function):
+        return _not_function(name, function)
+    six = _six()
+    cases = [(six["af"], six["random_forest"] >= .2, DEFAULT_COSTS),
+             (six["af"], six["random_forest"] >= .5, DEFAULT_COSTS),
+             (six["af"], six["random_forest"] >= .2, UNUSUAL_COSTS),
+             (np.zeros(3, dtype=bool), np.zeros(3, dtype=bool), UNUSUAL_COSTS)]
+    for y, review, costs in cases:
+        got, error = _call(function, y, review, costs)
+        if error is not None:
+            if len(set(np.asarray(y))) == 1:
+                return _report(name, ["With one class present the confusion matrix is 1 × 1. "
+                                      "Pass labels=[False, True]."])
+            return _report(name, [f"It raised {type(error).__name__}: {error}."])
+        if got is Ellipsis:
+            return _waiting(name)
+        expected = reference.policy_cost(y, review, costs)
+        if _near(got, expected):
+            continue
+        hint = _first_match(got, _cost_variants(y, review, costs))
+        return _report(name, [f"With prices {costs} expected {expected:g}, received {got!r}. "
+                              + (hint or "Multiply each count by its price and add the four.")])
+    return _report(name, [])
+
+
+# --- Section 4 ----------------------------------------------------------------
+
+
+def _frame_problem(name, got, columns):
+    if not isinstance(got, pd.DataFrame):
+        return _report(name, [f"Return a pandas DataFrame; received {type(got).__name__}."])
+    missing = [c for c in columns if c not in got.columns]
+    if missing:
+        return _report(name, [f"The table has no column {', '.join(map(repr, missing))}."])
+    return None
+
+
+def _columns_match(got, expected, columns, tolerance=1e-9):
+    for column in columns:
+        a = pd.to_numeric(got[column], errors="coerce").to_numpy(dtype=float)
+        b = expected[column].to_numpy(dtype=float)
+        if a.shape != b.shape or not np.allclose(a, b, rtol=tolerance, atol=tolerance,
+                                                 equal_nan=True):
+            return column
+    return None
+
+
+
+COMPARE_COLUMNS = ("cutoff", "reviews", "af_detected", "af_missed", "loss")
+MODELS = ("random_forest", "resnet")
+
+
+def _consequences_at(frame, model, cutoff, costs):
+    """Reviews, AF detected and missed per 1,000, and the loss, of one model at one cutoff."""
+    review = frame[model] >= cutoff
+    c, n = reference.counts(frame["af"], review), len(frame)
+    return {"reviews": 1000 * (c["TP"] + c["FP"]) / n, "af_detected": 1000 * c["TP"] / n,
+            "af_missed": 1000 * c["FN"] / n, "loss": reference.policy_cost(frame["af"], review, costs)}
+
+
+def _cutoff_problem(got, frame, costs, expected):
+    """None when each model's cutoff attains the minimum loss and its row reports what it does.
+
+    The check is semantic: the decisions the submitted cutoff makes on the frame
+    are computed, so a cutoff that merely looks close to the reference is not
+    enough. Several cutoffs can make the same decisions, and different decisions
+    can tie on loss; any of them is accepted, as the guides promise. Otherwise the
+    hint names the first problem, comparing each row with its own cutoff.
+    """
+    cutoffs = {}
+    for model in got.index:
+        try:
+            cutoffs[model] = float(got.loc[model, "cutoff"])
+        except (TypeError, ValueError):
+            return f"The cutoff for {model} should be one number."
+    for model, cutoff in cutoffs.items():
+        actual = _consequences_at(frame, model, cutoff, costs)
+        if not math.isclose(actual["loss"], float(expected.loc[model, "loss"]), rel_tol=1e-9):
+            if all(math.isclose(c, .5) for c in cutoffs.values()):
+                return ("Both models are still judged at 0.5, the default boundary of predict(). "
+                        "Their scores are on different scales: find each model's cheapest cutoff "
+                        "in its own operating-point table.")
+            return (f"At the cutoff given for {model} the loss is {actual['loss']:g}, not the minimum "
+                    f"{float(expected.loc[model, 'loss']):g}. Choose each model's row with the lowest "
+                    "loss (fewest reviews on a tie), using its threshold as it is, not rounded.")
+        for key, value in actual.items():
+            if not _near(pd.to_numeric(got.loc[model, key], errors="coerce"), value):
+                return (f"Column {key!r} differs for {model}: at that cutoff it should be "
+                        f"{value:g}. Report the counts per 1,000 recordings that the cutoff gives.")
+    return None
+
+
+def compare_models(function):
+    """Problem 4: each model at its own minimum-loss cutoff under the same prices."""
+    name = "compare_models"
+    if not callable(function):
+        return _not_function(name, function)
+    development = _split("development")
+    for costs in (DEFAULT_COSTS, UNUSUAL_COSTS):
+        got, error = _call(function, development, list(MODELS), costs)
+        if error is not None:
+            return _report(name, [f"It raised {type(error).__name__}: {error}."])
+        if got is Ellipsis:
+            return _waiting(name)
+        problem = _frame_problem(name, got, COMPARE_COLUMNS)
+        if problem is not None:
+            return problem
+        expected = reference.compare_models(development, list(MODELS), costs)
+        try:
+            got = got.loc[list(MODELS)]
+        except KeyError:
+            return _report(name, ["Index the table by model name, as the original does."])
+        problem = _cutoff_problem(got, development, costs, expected)
+        if problem is not None:
+            return _report(name, [problem])
+    return _report(name, [])
+
+
+# --- Section 6 ----------------------------------------------------------------
+
+
+def _reference_recalibration():
+    fitting = _split("calibration")
+    return calibration.platt().fit(fitting[["resnet"]], fitting["af"])
+
+
+def recalibration(model):
+    """Problem 5: the Platt map, fitted on the calibration split only."""
+    name = "recalibration"
+    if model is Ellipsis:
+        return _waiting(name)
+    if not hasattr(model, "predict_proba"):
+        return _report(name, ["Expected a fitted scikit-learn model with predict_proba, for "
+                              "example a pipeline of FunctionTransformer(logit) and "
+                              "LogisticRegression."])
+    development = _split("development")
+    got, error = _call(lambda: model.predict_proba(development[["resnet"]])[:, 1])
+    if isinstance(error, NotFittedError):
+        return _report(name, ["The model is not fitted yet: call .fit(...) on the calibration "
+                              "split's resnet scores and AF labels."])
+    if error is not None:
+        return _report(name, [f"predict_proba raised {type(error).__name__}: {error}. Fit on a "
+                              "one-column DataFrame, calibration_split[['resnet']]."])
+    expected = _reference_recalibration().predict_proba(development[["resnet"]])[:, 1]
+    if np.allclose(got, expected, atol=5e-4, rtol=0):
+        return _report(name, [])
+    fits = {}
+    for split in ("development", "evaluation"):
+        frame = _split(split)
+        fits[f"the {split} split"] = calibration.platt().fit(frame[["resnet"]], frame["af"])
+    fitting = _split("calibration")
+    fits["penalty"] = LogisticRegression(solver="newton-cholesky").fit(logit(fitting[["resnet"]]), fitting["af"])
+    fits["raw"] = LogisticRegression(C=np.inf, solver="newton-cholesky").fit(fitting[["resnet"]], fitting["af"])
+    for label, fit in fits.items():
+        x = logit(development[["resnet"]]) if label == "penalty" else development[["resnet"]]
+        # The raw-score fit is far from the answer, and solvers disagree more on unscaled scores.
+        tolerance = 2e-3 if label == "raw" else 5e-4
+        if np.allclose(got, fit.predict_proba(x)[:, 1], atol=tolerance, rtol=0):
+            if label == "penalty":
+                return _report(name, ["LogisticRegression shrinks its coefficients by default "
+                                      "(C=1). Switch the penalty off with C=np.inf."])
+            if label == "raw":
+                return _report(name, ["This regresses on the raw score. Platt scaling uses "
+                                      "logit(score) as the feature: put "
+                                      "FunctionTransformer(logit) first in the pipeline."])
+            return _report(name, [f"This map was fitted on {label}. Fit it on the calibration "
+                                  "split only: development chooses policies and evaluation "
+                                  "assesses them."])
+    return _report(name, ["The fitted probabilities differ from a Platt map fitted on the "
+                          "calibration split. Use logit(resnet) as the one feature and no penalty."])
+
+
+def net_benefit(function):
+    """Problem 6: TP/n - FP/n × p_t/(1 - p_t)."""
+    name = "net_benefit"
+    if not callable(function):
+        return _not_function(name, function)
+    six, development = _six(), _split("development")
+    cases = [(six["af"], six["random_forest"] >= .2, .2),
+             (development["af"], development["random_forest"] >= .1, .1),
+             (development["af"], development["resnet"] >= .4, .4)]
+    for y, review, p_t in cases:
+        got, error = _call(function, y, review, p_t)
+        if error is not None:
+            return _report(name, [f"It raised {type(error).__name__}: {error}."])
+        if got is Ellipsis:
+            return _waiting(name)
+        expected = reference.net_benefit(y, review, p_t)
+        if _near(got, expected):
+            continue
+        c = reference.counts(y, review)
+        n, odds = sum(c.values()), p_t / (1 - p_t)
+        hint = _first_match(got, [
+            (c["TP"] - c["FP"] * odds, "Divide by n, the number of recordings."),
+            ((c["TP"] - c["FP"] * p_t) / n, "Weight false positives by the odds p_t/(1 - p_t), "
+                                            "not by p_t."),
+            ((c["TP"] - c["FP"] / odds) / n, "The odds are inverted: use p_t/(1 - p_t)."),
+            ((c["TP"] - c["FN"] * odds) / n, "Net benefit charges false positives, not misses."),
+            ((c["TP"] - c["FP"] * odds) / max(c["TP"] + c["FP"], 1),
+             "Divide by all recordings, not only the reviewed ones."),
+        ])
+        return _report(name, [f"At p_t = {p_t} expected {expected:.4f}, received {got!r}. "
+                              + (hint or "")])
+    return _report(name, [])
+
+
+# --- Section 7 ----------------------------------------------------------------
+
+FROZEN_KEYS = ("model", "cutoff", "costs", "p_t", "chosen_on")
+
+
+def frozen_policy(frozen):
+    """Problem 7: a complete frozen policy whose preference follows from its prices.
+
+    The checker never reads the evaluation split and cannot judge the choice:
+    a cutoff derived from the prices is as legitimate as one read from the
+    development table. It checks completeness and that ``p_t`` follows from
+    the prices, and records where the cutoff was chosen.
     """
     name = "Frozen policy"
-    if any(value is Ellipsis for value in (model, threshold, costs, predicted_loss)):
+    if _unfinished(frozen):
         return _waiting(name)
+    problem = _missing_keys(name, frozen, FROZEN_KEYS)
+    if problem is not None:
+        return problem
+    model, cutoff, costs, p_t, chosen_on = (frozen[k] for k in FROZEN_KEYS)
     problems = []
     if model not in data.MODEL_NAMES:
-        problems.append(f"Set final_model to one of {', '.join(repr(m) for m in data.MODEL_NAMES)}.")
-    if not _is_number(threshold) or not 0 <= threshold <= 1.01:
-        problems.append("Set final_threshold to a score cutoff between 0 and 1.01, chosen on the "
-                        "development split.")
-    if not isinstance(costs, dict) or set(costs) != {"TP", "FP", "FN", "TN"} or not all(
-            _is_number(v) and math.isfinite(v) for v in costs.values()):
-        problems.append("Set final_costs to a dictionary of four finite prices with the keys "
-                        "'TP', 'FP', 'FN' and 'TN', for example dict(costs).")
-    if not _is_number(predicted_loss) or not math.isfinite(predicted_loss) or predicted_loss < 0:
-        problems.append("Set predicted_evaluation_loss to one number: the total loss you expect "
-                        "on the evaluation split.")
+        problems.append(f"Set model to one of {', '.join(map(repr, data.MODEL_NAMES))}.")
+    if not (isinstance(costs, dict) and set(costs) == set(COUNT_KEYS)
+            and all(_is_number(v) and math.isfinite(v) for v in costs.values())):
+        problems.append("Set costs to a dictionary of four finite prices with the keys 'TP', "
+                        "'FP', 'FN' and 'TN'.")
+    if not _is_number(cutoff) or not (0 <= cutoff <= 1 or math.isinf(cutoff)):
+        problems.append("Set cutoff to one number between 0 and 1 on that model's score scale.")
+    if not isinstance(chosen_on, str) or not chosen_on.strip():
+        problems.append("Say in chosen_on how the cutoff was chosen, for example 'development "
+                        "minimum loss' or 'derived from the prices'.")
     if problems:
         return _report(name, problems)
-    development = reference.policy_summary(data.load_records(model, "development"), threshold, costs)
-    evaluation_size = len(data.load_records(model, "evaluation"))
-    # Only a positive development total can be copied unscaled: a total of zero scales to zero.
-    if (development["total_loss"] > 0 and _near(predicted_loss, development["total_loss"])
-            and evaluation_size != development["recordings"]):
-        return _report(name, [
-            f"That is the development total over {development['recordings']:,} recordings. The "
-            f"evaluation split has {evaluation_size:,}, so scale the total before predicting."])
-    if development["total_loss"] > 0 and 0 < predicted_loss <= 10 * development["mean_loss"]:
-        return _report(name, ["That looks like a loss per recording. Predict the total over the "
-                              "evaluation recordings."])
-    return _report(name, [], success="frozen. The checker cannot judge your choice or your "
-                                     "prediction; the next cell reveals the evaluation result")
+    try:
+        implied = reference.threshold_probability(costs)
+    except ValueError:
+        return _report(name, ["These prices give no threshold probability; choose prices with "
+                              "C_FP > C_TN and C_FN > C_TP."])
+    if not _near(p_t, implied):
+        return _report(name, [f"p_t should follow from the prices: {implied:.4f}."])
+    return _report(name, [], success=f"frozen ({chosen_on.strip()})")
 
 
-def reflection(answer):
-    """Optional decision statement: records a substantive statement; it does not grade the valuation."""
-    name = "Decision statement"
-    if answer is Ellipsis:
+# --- Section 8 ----------------------------------------------------------------
+
+RECORD_TEXT = ("action", "price_rationale", "reopen_if")
+
+
+def decision_record(record, frozen, reports):
+    """Problem 7, second part: the three sentences of the decision record, then the whole record.
+
+    The learner writes ``action``, ``price_rationale`` and ``reopen_if``; the
+    checker adds the frozen policy and the two reports, so the record is
+    consistent by construction, and prints it. It cannot judge the valuation.
+    """
+    name = "Decision record"
+    if _unfinished(record):
         return _waiting(name)
-    if not isinstance(answer, str) or len(answer.split()) < REFLECTION_MIN_WORDS:
-        return _report(name, ["Write four or five sentences: the action, your prices, the policy, "
-                              "the evidence for it and one assumption that would change it."])
-    return _report(name, [], success="recorded. A keyword rule cannot judge a valuation; discuss "
-                                     "the reasoning with your neighbour")
+    problem = _missing_keys(name, record, RECORD_TEXT)
+    if problem is not None:
+        return problem
+    problems = [f"Write {key} in a sentence or two." for key in RECORD_TEXT
+                if not isinstance(record[key], str) or not record[key].strip()]
+    if not (isinstance(frozen, dict) and isinstance(reports, dict)
+            and {"development", "evaluation"} <= set(reports)):
+        problems.append("Freeze your policy and run the reveal first.")
+    if problems:
+        return _report(name, problems)
+    full = {"action": record["action"], "prices": frozen.get("costs"), "model": frozen.get("model"),
+            "cutoff": frozen.get("cutoff"), "chosen_on": frozen.get("chosen_on"),
+            "price_rationale": record["price_rationale"], "reopen_if": record["reopen_if"]}
+    for key, value in full.items():
+        print(f"{key}: {value}")
+    for split in ("development", "evaluation"):
+        print(f"{split} report:")
+        print(reports[split].round(3).to_string())
+    return _report(name, [], success="recorded. A checker cannot judge a valuation; read it back "
+                                     "as the service would")
+
+
+# --- Previews of learner code ---------------------------------------------------
+
+
+def show(function, *args):
+    """Run learner code and display what it returns, without letting it stop the notebook.
+
+    A preview sits inside the same no-raise boundary as the checkers: an
+    unfinished answer or an error is reported in one line, and the checker in
+    the same cell still runs.
+    """
+    from IPython.display import display
+    if not callable(function):
+        print(f"Nothing to preview yet: expected a function, received {type(function).__name__}.")
+        return None
+    result, error = _call(function, *args)
+    if error is not None:
+        print(f"Preview not available yet: {type(error).__name__}: {error}. The checker below says "
+              "what to change.")
+        return None
+    if _unfinished(result):
+        print("Preview not available yet: the function still returns ... somewhere.")
+        return None
+    display(result)
+    return result
 
 
 # --- Quiet guard for cells that build on earlier answers -------------------
@@ -636,16 +632,18 @@ def waiting(what):
 
 
 # Functions later cells wait for: (checker, problem, has an I'm-stuck switch).
-WAITED_FOR = {"decision_cost": ("decision_cost", "Problem 4", True),
-              "youden_j": ("youden_j", "Problem 6", True),
-              "repaired_colleague_cost": ("colleague_cost", "Problem 11", False),
-              "net_benefit": ("net_benefit", "Problem 12", True)}
+WAITED_FOR = {"threshold_probability": ("threshold_probability", "Problem 1", True),
+              "six_counts": ("six_counts", "Problem 2", False),
+              "policy_cost": ("policy_cost", "Problem 3", True),
+              "compare_models": ("compare_models", "Problem 4", False),
+              "recalibration": ("recalibration", "Problem 5", True),
+              "net_benefit": ("net_benefit", "Problem 6", True)}
 
 
 def ready(**answers):
     """True when every named answer passes its checker; prints one line per wait otherwise.
 
-    ``check.ready(decision_cost=decision_cost)`` lets a later cell wait for an
+    ``check.ready(policy_cost=policy_cost)`` lets a later cell wait for an
     unfinished function instead of failing. Each line names the problem, how to
     unblock it and how to recover (``RECOVERY``). Nothing is printed when all pass.
     """
@@ -673,25 +671,24 @@ def ready(**answers):
     return CheckResult(not waiting)
 
 
-def _reference_youden_j(counts):
-    """Reference J: sensitivity + specificity − 1."""
-    return reference.metrics(counts)["youden_j"]
-
-
-REFERENCE_VERSIONS = {"decision_cost": reference.decision_cost,
-                      "youden_j": _reference_youden_j,
+REFERENCE_VERSIONS = {"threshold_probability": reference.threshold_probability,
+                      "policy_cost": reference.policy_cost,
                       "net_benefit": reference.net_benefit}
 
 
 def use_reference(name):
     """Return the reference version of a function later cells depend on, and say so.
 
-    For a pair that is stuck: ``decision_cost = check.use_reference("decision_cost")``
+    For a learner who is stuck: ``policy_cost = check.use_reference("policy_cost")``
     lets the rest of the notebook run. Their own attempt is untouched until that
     line runs, so they can come back to it later.
     """
+    if name == "recalibration":
+        print("Using the reference recalibration, fitted on the calibration split, from now on. "
+              "Come back to your own version later and compare it with the worked copy.")
+        return _reference_recalibration()
     if name not in REFERENCE_VERSIONS:
-        listed = ", ".join(repr(k) for k in REFERENCE_VERSIONS)
+        listed = ", ".join(repr(k) for k in [*REFERENCE_VERSIONS, "recalibration"])
         print(f"There is no reference version of {name!r}. Choose one of {listed}.")
         return None
     print(f"Using the reference {name} from now on. Come back to your own version later and "
@@ -721,6 +718,6 @@ def _guarded(checker):
 for _name, _function in list(globals().items()):
     if (inspect.isfunction(_function) and _function.__module__ == __name__
             and not _name.startswith("_")
-            and _name not in ("first_flip_price", "ready", "use_reference", "waiting")):
+            and _name not in ("ready", "use_reference", "waiting", "show")):
         globals()[_name] = _guarded(_function)
 del _name, _function
