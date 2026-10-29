@@ -1,0 +1,38 @@
+[
+  {
+    "recording": "Teaching A",
+    "reference_label": "A",
+    "af_present": true,
+    "score": 0.9
+  },
+  {
+    "recording": "Teaching B",
+    "reference_label": "N",
+    "af_present": false,
+    "score": 0.75
+  },
+  {
+    "recording": "Teaching C",
+    "reference_label": "A",
+    "af_present": true,
+    "score": 0.6
+  },
+  {
+    "recording": "Teaching D",
+    "reference_label": "N",
+    "af_present": false,
+    "score": 0.4
+  },
+  {
+    "recording": "Teaching E",
+    "reference_label": "A",
+    "af_present": true,
+    "score": 0.25
+  },
+  {
+    "recording": "Teaching F",
+    "reference_label": "N",
+    "af_present": false,
+    "score": 0.1
+  }
+]

@@ -1,0 +1,126 @@
+{
+  "title": "CinC 2017 reference labels with simulated model scores",
+  "source": "https://physionet.org/files/challenge-2017/1.0.0/REFERENCE-v3.csv",
+  "dataset": "https://physionet.org/content/challenge-2017/1.0.0/",
+  "reference_version": "REFERENCE-v3.csv; dataset 1.0.0",
+  "reference_sha256": "ae517e474b0bc89a7517ad876b5b4dadc6c94f680d0665c04746db9432df855b",
+  "acquired": "2026-10-28",
+  "reference_licence": "Open Data Commons Attribution 1.0",
+  "reference_licence_url": "https://opendatacommons.org/licenses/by/1-0/",
+  "citation": "Clifford et al. AF classification from a short single lead ECG recording. Computing in Cardiology 2017. doi:10.22489/CinC.2017.065-469",
+  "reference_counts": {
+    "N": 5076,
+    "A": 758,
+    "O": 2415,
+    "~": 279
+  },
+  "eligible_counts": {
+    "N": 5076,
+    "A": 758,
+    "O": 2415
+  },
+  "split_counts": {
+    "development": 3711,
+    "evaluation": 2889,
+    "calibration": 1649
+  },
+  "split_fractions": {
+    "development": 0.45,
+    "calibration": 0.2,
+    "evaluation": 0.35
+  },
+  "seed": 20261106,
+  "prediction_status": "All scores are simulated conditional on recording reference labels. No ECG models were trained or run.",
+  "simulation": {
+    "evidence": "One unit-variance Gaussian evidence value per model and recording; its mean is a component drawn from the recording's reference-label mixture.",
+    "shared_noise_loading": 0.4,
+    "residual_correlation_between_models": 0.16,
+    "shared_noise": "Each model's noise is loading * shared + sqrt(1 - loading^2) * own, both standard normal, so the two models' noise terms have correlation loading^2.",
+    "class_priors_for_posterior": {
+      "A": 0.09188992605164262,
+      "N": 0.6153473148260395,
+      "O": 0.29276275912231786
+    },
+    "random_forest_mixture": {
+      "A": [
+        [
+          0.1,
+          0.0
+        ],
+        [
+          0.16,
+          2.2
+        ],
+        [
+          0.74,
+          3.6
+        ]
+      ],
+      "N": [
+        [
+          1.0,
+          0.0
+        ]
+      ],
+      "O": [
+        [
+          0.24,
+          2.2
+        ],
+        [
+          0.76,
+          0.6
+        ]
+      ]
+    },
+    "resnet_mixture": {
+      "A": [
+        [
+          1.0,
+          3.2
+        ]
+      ],
+      "N": [
+        [
+          1.0,
+          0.0
+        ]
+      ],
+      "O": [
+        [
+          0.4,
+          3.0
+        ],
+        [
+          0.6,
+          0.6
+        ]
+      ]
+    },
+    "raw_resnet_distortion": "resnet = sigmoid(intercept + slope * posterior logit)",
+    "raw_resnet_parameters": {
+      "intercept": 3.0,
+      "slope": 1.5
+    }
+  },
+  "models": {
+    "random_forest": "Posterior AF probability under its simulated mixture: a 10% component of AF recordings draws normal-looking evidence and a 16% component shares an ambiguous group with O recordings near probability 0.2. These are mixture weights, not miss rates at any cutoff. Not empirical random-forest performance.",
+    "resnet": "Raw simulated waveform-model score. AF evidence is centred at 3.2, and a 40% mixture component of O recordings draws AF-like evidence centred at 3.0. These are mixture weights, not rates at any cutoff. Deliberately too high and too extreme (overconfident).",
+    "resnet_calibrated": "Platt recalibration of the raw resnet score, fitted on calibration records only; same ranking as resnet."
+  },
+  "calibration": {
+    "method": "Platt scaling: sigmoid(intercept + slope * logit(resnet))",
+    "intercept": -1.9850685570344673,
+    "slope": 0.6568150601375636,
+    "fit_split": "calibration",
+    "ranking_preserved": true
+  },
+  "limitations": [
+    "Scores are simulated from reference labels; they are not outputs of trained classifiers.",
+    "Recording-level labels only: no interval (window) truth and no patient outcomes.",
+    "Noise-labelled recordings retained in the source file, excluded from binary AF analysis.",
+    "N and O are AF-negative reference categories, not interchangeable clinical states.",
+    "Reference class proportions are not deployment prevalence.",
+    "Splits serve a simulated teaching exercise, not patient-level clinical validation."
+  ]
+}
