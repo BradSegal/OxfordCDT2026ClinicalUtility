@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cdt-clinical-utility"
+version = "0.1.0"
+description = "Clinical decisions from simulated ECG model scores: a Colab teaching practical"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "scikit-learn>=1.6",
+    "scipy>=1.15",
+    "plotly>=5.18",
+    "matplotlib>=3.8",
+]
+authors = [{name = "Bradley Segal"}]
+license = "MIT"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+clinical_utility = ["assets/*"]
